@@ -52,10 +52,7 @@ export default function About() {
           </h2>
 
           <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
-            Every chart Prism draws is designed to reveal the truth in your data,
-            not to impress. We obsess over defaults—the right scale, the right
-            labels, the right emphasis—so the clearest view is always the first
-            one you see.
+            Hi, I'm Miles! I'm transferring from Irvine Valley College. I love listening to all sorts of music, but recently I really like EDM, especially Knock2, William Black, and Juelz.
           </p>
         </div>
 
@@ -72,9 +69,7 @@ export default function About() {
           </h2>
 
           <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
-            We&apos;re building toward a world where anyone on a team can ask a
-            question of their data and get a trustworthy answer in seconds. The
-            visualizer you can try today is just the first step in that journey.
+            Hi, I'm Yosef! I'm transferring from Los Angeles Valley College. I love listening to EDM.
           </p>
         </div>
       </div>
@@ -94,10 +89,7 @@ export default function About() {
           </h2>
 
           <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
-            Every chart Prism draws is designed to reveal the truth in your data,
-            not to impress. We obsess over defaults—the right scale, the right
-            labels, the right emphasis—so the clearest view is always the first
-            one you see.
+            Hi, I'm Ray! I'm transferring from Ohlone College + Chabot College. I love listening to Kanye.
           </p>
         </div>
 
@@ -114,9 +106,7 @@ export default function About() {
           </h2>
 
           <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
-            We&apos;re building toward a world where anyone on a team can ask a
-            question of their data and get a trustworthy answer in seconds. The
-            visualizer you can try today is just the first step in that journey.
+            Hi, I'm Isaiah! I'm transferring from Los Angeles Pierce College.
           </p>
         </div>
       </div>
