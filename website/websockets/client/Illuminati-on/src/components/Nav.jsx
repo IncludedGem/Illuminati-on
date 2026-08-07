@@ -15,10 +15,14 @@ export default function Nav() {
     <header className="sticky top-0 z-50 border-b border-border bg-background/80 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
         <Link to="/" className="flex items-center gap-2" onClick={() => setOpen(false)}>
-          <span className="flex h-8 w-8 items-center justify-center rounded-md bg-foreground text-background">
-            <Triangle className="h-4 w-4 fill-background" strokeWidth={0} />
+          <span className="flex h-10 w-10 items-center justify-center">
+            <img
+              src="\images\logo.png"
+              alt="Band logo"
+              className="h-full w-full object-contain"
+            />
           </span>
-          <span className="text-lg font-semibold tracking-tight">Prism</span>
+          <span className="text-lg font-semibold tracking-tight">Illuminati-on</span>
         </Link>
 
         <nav className="hidden items-center gap-1 md:flex">

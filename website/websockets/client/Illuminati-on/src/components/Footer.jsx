@@ -6,10 +6,14 @@ export default function Footer() {
     <footer className="border-t border-border">
       <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-6 py-10 sm:flex-row">
         <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded bg-foreground text-background">
-            <Triangle className="h-3 w-3 fill-background" strokeWidth={0} />
+          <span className="flex h-10 w-10 items-center justify-center">
+            <img
+              src="\favicon.svg"
+              alt="Band logo"
+              className="h-full w-full object-contain"
+            />
           </span>
-          <span className="text-sm font-medium">Prism</span>
+          <span className="text-sm font-medium">Illuminati-on</span>
         </div>
 
         <nav className="flex items-center gap-6 text-sm text-muted-foreground">
@@ -25,7 +29,7 @@ export default function Footer() {
         </nav>
 
         <p className="text-sm text-muted-foreground">
-          &copy; {new Date().getFullYear()} Prism Labs
+          &copy; {new Date().getFullYear()} Illuminati-on Band
         </p>
       </div>
     </footer>
