@@ -9,19 +9,19 @@ KEY_MAP = [
     ["*", "0", "#"]
 ]
 
-# Set rows as Outputs on GP2, GP3, GP4, GP5 (default driven HIGH)
+# Set rows as Outputs on GP0, GP1, GP2, GP3 (default driven HIGH)
 row_pins = [
+    Pin(0, Pin.OUT, value=1),
+    Pin(1, Pin.OUT, value=1),
     Pin(2, Pin.OUT, value=1),
-    Pin(3, Pin.OUT, value=1),
-    Pin(4, Pin.OUT, value=1),
-    Pin(5, Pin.OUT, value=1)
+    Pin(3, Pin.OUT, value=1)
 ]
 
-# Set columns as Inputs on GP6, GP7, GP8 with internal pull-up resistors
+# Set columns as Inputs on GP6, GP7, GP16 with internal pull-up resistors
 col_pins = [
     Pin(6, Pin.IN, Pin.PULL_UP),
     Pin(7, Pin.IN, Pin.PULL_UP),
-    Pin(8, Pin.IN, Pin.PULL_UP)
+    Pin(16, Pin.IN, Pin.PULL_UP)
 ]
 
 def scan_keypad():
@@ -55,5 +55,3 @@ while True:
     if pressed_key:
         print(f"Detected Key: {pressed_key}")
     time.sleep_ms(30)  # Polling cycle interval
-
-
