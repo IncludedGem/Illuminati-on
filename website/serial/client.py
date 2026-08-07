@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 
 # Configuration
-SERIAL_PORT = '/dev/cu.usbmodem1201'  # Change to 'COM3' on Windows, '/dev/ttyUSB0' for other boards
+SERIAL_PORT = 'COM24'  # Change to 'COM3' on Windows, '/dev/ttyUSB0' for other boards
 BAUD_RATE = 115200
 WEBSOCKET_URL = 'ws://localhost:8765'
 

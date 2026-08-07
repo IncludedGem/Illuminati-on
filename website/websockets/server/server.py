@@ -1,68 +1,77 @@
 import asyncio
-import websockets
 import json
-from datetime import datetime
+import websockets
 
-# Store all messages
-chat_logs = []
-# Store all connected clients
+# Connected website clients
 connected_clients = set()
 
+# Current instrument state
+instrument = {
+    "octave": 4,
+    "key": "C",
+    "sample": "Grand Piano",
+    "volume": 50,
+    "keys": [False] * 8
+}
 
-def print_chat_logs():
-    print("\n" + "="*60)
-    print("CHAT LOGS")
-    print("="*60)
-    if not chat_logs:
-        print("No messages yet")
-    else:
-        for i, log in enumerate(chat_logs, 1):
-            print(f"{i}. [{log['timestamp']}] {log['message']}")
-    print("="*60 + "\n")
+
+async def broadcast():
+    """Send the current instrument state to every connected client."""
+
+    if not connected_clients:
+        return
+
+    message = json.dumps(instrument)
+
+    disconnected = set()
+
+    for client in connected_clients:
+        try:
+            await client.send(message)
+        except websockets.exceptions.ConnectionClosed:
+            disconnected.add(client)
+
+    connected_clients.difference_update(disconnected)
 
 
 async def handle_client(websocket):
-    print(f"Client connected from {websocket.remote_address}")
+    print(f"Client connected: {websocket.remote_address}")
+
     connected_clients.add(websocket)
+
+    # Send the current state immediately when a client connects
+    await websocket.send(json.dumps(instrument))
+
     try:
         async for message in websocket:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Store in chat logs
-            chat_logs.append({
-                "message": message,
-                "timestamp": timestamp
-            })
-            print(f"Received: {message}")
-            # Broadcast the message to all connected clients
-            response = {
-                "status": "received",
-                "original_message": message,
-                "timestamp": timestamp
-            }
-            # Send to all connected clients
-            disconnected = set()
-            for client in connected_clients:
-                try:
-                    await client.send(json.dumps(response))
-                except websockets.exceptions.ConnectionClosed:
-                    disconnected.add(client)
-            # Remove disconnected clients
-            for client in disconnected:
-                connected_clients.discard(client)
+            print("Received:", message)
+
+            try:
+                # Parse JSON received from the serial client
+                data = json.loads(message)
+
+                # Update the current instrument state
+                instrument.update(data)
+
+                # Broadcast the new state to every connected client
+                await broadcast()
+
+            except json.JSONDecodeError:
+                print("Invalid JSON received:")
+                print(message)
+
     except websockets.exceptions.ConnectionClosed:
-        print(f"Client {websocket.remote_address} disconnected")
+        print(f"Client disconnected: {websocket.remote_address}")
+
     finally:
         connected_clients.discard(websocket)
 
 
 async def main():
     async with websockets.serve(handle_client, "localhost", 8765):
-        print("WebSocket server started on ws://localhost:8765")
-        await asyncio.Future()  # run forever
+        print("WebSocket server running on ws://localhost:8765")
+        await asyncio.Future()  # Run forever
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Interrupted")
+    asyncio.run(main())
