@@ -15,4 +15,4 @@ node_modules
 .DS_Store
 
 # Ignore Python virtual environment in website
-website/.venv/
+../.venv/
