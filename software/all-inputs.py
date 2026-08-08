@@ -477,22 +477,23 @@ adc = ADC(26)
 previous_volume = -1
 
 # ---- Volume pot calibration ----
-# Slide pots rarely actually swing the full 0-65535 ADC range in
-# practice (wiring resistance, the pot's own tolerance, etc). If you
-# hardcode 0-65535 as the endpoints, whatever the pot's *real* range
-# turns out to be gets squashed into a smaller chunk of that -- which
-# is exactly the "bottom never reads 0" / "halfway already reads 100"
-# symptom.
+# Pots rarely swing the full 0-65535 ADC range (wiring resistance,
+# pot tolerance). Hardcoding 0-65535 as endpoints squashes the real
+# range into part of it -- the "bottom never reads 0 / halfway
+# already reads 100" symptom.
 #
-# Instead we self-calibrate: the lowest and highest raw readings ever
-# seen become the 0% and 100% endpoints, so the whole physical slide
-# length maps to the whole 0-100 range with nothing wasted.
-#
-# After power-on, slide it all the way down then all the way up once
-# to calibrate. Until that first full sweep, readings are
-# stretched/clamped from whatever range has been seen so far.
+# So we self-calibrate: lowest and highest raw readings ever seen
+# become the 0% and 100% endpoints. After power-on, sweep the pot
+# end to end once to calibrate.
 adc_min = 65535
 adc_max = 0
+
+# The pot must show at least this much travel before we trust those
+# endpoints. Below this, the "range" is just ADC noise a few counts
+# wide, and dividing by it makes volume jump randomly between 0
+# and 100. 8000 is ~12% of full scale: well above noise, well
+# below any real pot's travel.
+MIN_ADC_SPAN = 8000
 
 
 # ============================================================
@@ -517,7 +518,7 @@ display = ssd1306.SSD1306_I2C(
 # ============================================================
 
 SAMPLE_RATE = 11025
-BUF_SAMPLES = 1024
+BUF_SAMPLES = 256
 
 audio = I2S(
     0,
@@ -528,7 +529,7 @@ audio = I2S(
     bits=16,
     format=I2S.MONO,
     rate=SAMPLE_RATE,
-    ibuf=8192,
+    ibuf=2048,
 )
 
 
@@ -649,7 +650,8 @@ def render_voice(v, mix_buf, n_samples):
 def generate_block(volume_pct):
     """Render one audio block using the given 0-100 volume percent
     (comes from whichever state is currently active)."""
-    vol = volume_pct / 100.0
+    v = volume_pct / 100.0
+    vol = v * v / 3.0     # square law + chord headroom
 
     i = 0
     while i < BUF_SAMPLES:
