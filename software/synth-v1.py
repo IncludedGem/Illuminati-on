@@ -342,7 +342,7 @@ ENVELOPES = {
 
 
 # Which instrument all 8 buttons use. Change this to any key above.
-INSTRUMENT = ""
+INSTRUMENT = "Organ" 
 
 # ---------------- Voices ----------------
 
@@ -509,3 +509,5 @@ while True:
     poll_buttons()
     generate_block()
     audio.write(out_buf)
+
+
