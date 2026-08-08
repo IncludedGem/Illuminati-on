@@ -415,7 +415,14 @@ ENVELOPES = {
     "Strings":  (140, 100, 0.92, 550),
 }
 
-SAMPLE_LIST = list(ENVELOPES.keys())
+# Explicit tuple, NOT list(ENVELOPES.keys()) -- MicroPython does not
+# preserve dict insertion order, so the cycle order would be scrambled
+# and unrehearsable. Must match the ENVELOPES keys exactly.
+SAMPLE_LIST = (
+    "Sine", "Square", "Sawtooth", "Triangle", "Pulse",
+    "Organ", "Bell", "Pluck", "Piano", "Guitar",
+    "Bass", "Flute", "Clarinet", "Trumpet", "Strings"
+)
 
 
 def increment_sample(current_sample):
@@ -518,7 +525,7 @@ display = ssd1306.SSD1306_I2C(
 # ============================================================
 
 SAMPLE_RATE = 11025
-BUF_SAMPLES = 256
+BUF_SAMPLES = 512
 
 audio = I2S(
     0,
@@ -529,7 +536,7 @@ audio = I2S(
     bits=16,
     format=I2S.MONO,
     rate=SAMPLE_RATE,
-    ibuf=2048,
+    ibuf=4096,
 )
 
 
@@ -999,8 +1006,7 @@ while True:
     if changed:
         active_state = states[active_index]
         displayState(active_state)
-        print(json.dumps(active_state))
-        print("")
+        print("#" + json.dumps(active_state))
 
     # ========================================================
     # AUDIO RENDER -- runs every loop, unconditionally
