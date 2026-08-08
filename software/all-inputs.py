@@ -4,7 +4,6 @@ import json
 from machine import Pin, I2C, ADC
 import ssd1306
 
-
 # ============================================================
 # 3x4 KEYPAD SETUP
 # ============================================================
@@ -17,47 +16,71 @@ KEY_MAP = [
 ]
 
 # Rows: GP0, GP1, GP2, GP3
+# Start as INPUTS. An input pin is "high-Z" -- electrically
+# disconnected. We only turn a row into an output for the
+# few microseconds we're actually scanning it.
 row_pins = [
-    Pin(0, Pin.OUT, value=1),
-    Pin(1, Pin.OUT, value=1),
-    Pin(2, Pin.OUT, value=1),
-    Pin(3, Pin.OUT, value=1)
+    Pin(0, Pin.IN),
+    Pin(1, Pin.IN),
+    Pin(2, Pin.IN),
+    Pin(3, Pin.IN)
 ]
 
-# Columns: GP6, GP7, GP19
+# Columns: GP6, GP7, GP19    <-- GP19, not GP16
 col_pins = [
     Pin(6, Pin.IN, Pin.PULL_UP),
     Pin(7, Pin.IN, Pin.PULL_UP),
     Pin(19, Pin.IN, Pin.PULL_UP)
 ]
 
+# Ignore any change on a key within this many ms of its last
+# change. Mechanical switches "bounce" (rapidly make/break
+# contact) for a few ms when pressed.
+DEBOUNCE_MS = 20
+
+# What we believe each key's state is right now. 12 keys,
+# index = row * 3 + col.  1 = down, 0 = up.
+key_down = bytearray(12)
+
+# When each key last changed state (ms).
+key_time = [0] * 12
+
 
 def scan_keypad():
-    """Scan the 3x4 keypad and return the pressed key."""
+    """Sample the keypad once and return the key that was JUST
+    pressed, or None. Never waits for anything."""
 
-    for row_idx, row_pin in enumerate(row_pins):
+    now = time.ticks_ms()
+    just_pressed = None
 
-        # Drive current row LOW
-        row_pin.value(0)
+    for row_idx in range(4):
+        row = row_pins[row_idx]
 
-        for col_idx, col_pin in enumerate(col_pins):
+        # Make this one row an output, driven LOW
+        row.init(Pin.OUT, value=0)
 
-            if col_pin.value() == 0:
+        for col_idx in range(3):
+            i = row_idx * 3 + col_idx
 
-                # Wait for key release
-                while col_pin.value() == 0:
-                    time.sleep_ms(10)
+            # Column reads LOW = this key is bridging row to column
+            is_down = 1 if col_pins[col_idx].value() == 0 else 0
 
-                # Restore row
-                row_pin.value(1)
+            # Only care when the state is different from what we
+            # last recorded
+            if is_down != key_down[i]:
 
-                return KEY_MAP[row_idx][col_idx]
+                # ...and enough time has passed to trust it
+                if time.ticks_diff(now, key_time[i]) > DEBOUNCE_MS:
+                    key_down[i] = is_down
+                    key_time[i] = now
 
-        # Restore row
-        row_pin.value(1)
+                    if is_down and just_pressed is None:
+                        just_pressed = KEY_MAP[row_idx][col_idx]
 
-    return None
+        # Put the row back to high-Z before moving on
+        row.init(Pin.IN)
 
+    return just_pressed
 
 # ============================================================
 # CHROMATIC SCALE
@@ -638,6 +661,5 @@ while True:
     # LOOP DELAY
     # ========================================================
 
-    time.sleep_ms(10)
 
 
