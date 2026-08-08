@@ -140,33 +140,18 @@ CHROMATIC_SCALE = [
     "F#", "G", "G#", "A", "A#", "B"
 ]
 
-ENHARMONIC_MAP = {
-    "Db": "C#",
-    "Eb": "D#",
-    "Gb": "F#",
-    "Ab": "G#",
-    "Bb": "A#",
-    "Cb": "B",
-    "Fb": "E",
-    "E#": "F",
-    "B#": "C"
-}
-
-
-def normalize_key(key):
-    return ENHARMONIC_MAP.get(key, key)
 
 
 def increment_key(current_key):
-    normalized = normalize_key(current_key)
-    idx = CHROMATIC_SCALE.index(normalized)
+
+    idx = CHROMATIC_SCALE.index(current_key)
     next_idx = (idx + 1) % len(CHROMATIC_SCALE)
     return CHROMATIC_SCALE[next_idx]
 
 
 def decrement_key(current_key):
-    normalized = normalize_key(current_key)
-    idx = CHROMATIC_SCALE.index(normalized)
+
+    idx = CHROMATIC_SCALE.index(current_key)
     prev_idx = (idx - 1) % len(CHROMATIC_SCALE)
     return CHROMATIC_SCALE[prev_idx]
 
@@ -175,8 +160,8 @@ def decrement_key(current_key):
 # OCTAVE
 # ============================================================
 
-MIN_OCTAVE = 1
-MAX_OCTAVE = 8
+MIN_OCTAVE = 2
+MAX_OCTAVE = 6
 
 
 def increment_octave(current_octave):
@@ -201,7 +186,7 @@ def build_scale_freqs(key, octave):
     major scale starting at `key` in `octave`. Standard equal
     temperament, A4 = 440Hz."""
 
-    root_idx = CHROMATIC_SCALE.index(normalize_key(key))
+    root_idx = CHROMATIC_SCALE.index(key)
     freqs = []
 
     for step in MAJOR_SCALE_STEPS:
@@ -863,9 +848,8 @@ while True:
 
     total = 0
 
-    # Average a handful of ADC readings with short microsecond delays
-    # (not millisecond sleeps) so this doesn't eat into the audio
-    # block's timing budget.
+    # Average a few ADC readings with microsecond (not millisecond)
+    # delays so this doesn't eat the audio block's timing budget.
     for _ in range(4):
         total += adc.read_u16()
         time.sleep_us(200)
@@ -879,11 +863,15 @@ while True:
     if raw_volume > adc_max:
         adc_max = raw_volume
 
-    # Map the CALIBRATED range to 0-100, not a hardcoded 0-65535
-    if adc_max > adc_min:
-        volume = round((raw_volume - adc_min) / (adc_max - adc_min) * 100)
+    span = adc_max - adc_min
+
+    if span >= MIN_ADC_SPAN:
+        # Calibrated: map the pot's real travel to 0-100
+        volume = round((raw_volume - adc_min) / span * 100)
     else:
-        volume = 0
+        # Not swept yet -- fall back to the nominal full range
+        volume = round(raw_volume / 65535 * 100)
+
     volume = max(0, min(100, volume))
 
     # ========================================================
