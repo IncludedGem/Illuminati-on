@@ -1,5 +1,5 @@
 from machine import Pin, I2C, ADC
-import ssd1306
+import ssd1306 
 import time
 import json
 

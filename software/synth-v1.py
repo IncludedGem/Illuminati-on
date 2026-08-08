@@ -109,23 +109,25 @@ def pulse25_fn(t):
     return 1.0 if t < 0.25 else -1.0
 
 
-# -------------------------------------------------
-# ORGAN
-# -------------------------------------------------
-# Strong fundamental + lower harmonics.
-# This is intentionally kept close to your version
-# because you said the organ already sounds good.
-
 def organ_fn(t):
+    # Fuller principal + mixture chorus: more ranks stacked than a basic
+    # 8'+4'+2' combo. Real organ "depth" comes from many simultaneously
+    # sounding pipes at different pitches (a chorus), not from one pipe's
+    # tone color -- so the fix here is adding more harmonic ranks, not
+    # making any single one louder.
     v = (
-        1.00 * math.sin(2 * math.pi * 1.00 * t)
-        + 0.55 * math.sin(2 * math.pi * 2.00 * t)
-        + 0.35 * math.sin(2 * math.pi * 3.00 * t)
-        + 0.25 * math.sin(2 * math.pi * 4.00 * t)
-        + 0.15 * math.sin(2 * math.pi * 5.00 * t)
-        + 0.10 * math.sin(2 * math.pi * 6.00 * t)
+        1.00 * math.sin(2 * math.pi * 1.00 * t)    # 8'   unison (fundamental)
+        + 0.75 * math.sin(2 * math.pi * 2.00 * t)    # 4'   octave
+        + 0.50 * math.sin(2 * math.pi * 3.00 * t)    # 2⅔'  twelfth (quint)
+        + 0.40 * math.sin(2 * math.pi * 4.00 * t)    # 2'   fifteenth
+        + 0.25 * math.sin(2 * math.pi * 5.00 * t)    # 1⅗'  tierce
+        + 0.20 * math.sin(2 * math.pi * 6.00 * t)    # 1⅓'  larigot
+        + 0.15 * math.sin(2 * math.pi * 8.00 * t)    # 1'   twenty-second
+        + 0.10 * math.sin(2 * math.pi * 9.00 * t)    # mixture rank
+        + 0.08 * math.sin(2 * math.pi * 10.00 * t)   # mixture rank
+        + 0.05 * math.sin(2 * math.pi * 12.00 * t)   # mixture top rank
     )
-    return v / 2.40
+    return v / 3.48
 
 
 # -------------------------------------------------
@@ -149,20 +151,23 @@ def bell_fn(t):
 # -------------------------------------------------
 # PLUCK
 # -------------------------------------------------
-# A plucked string starts bright, so we use a
-# saw-like spectrum with strong upper harmonics.
-# The short envelope supplies the pluck.
-
+# Harmonic amplitudes here follow the real physics of an ideal plucked
+# string (Young's theorem): amplitude of harmonic n is proportional to
+# sin(n*pi*p)/n, where p is the fractional pluck position along the
+# string. A harpsichord plectrum plucks close to the bridge (p ~ 1/8),
+# which is what makes it "tinny" and bright rather than round like a
+# guitar (which is typically plucked further out, closer to p ~ 0.23).
+# Computed for p = 1/8:
 def pluck_fn(t):
     v = (
-        1.00 * math.sin(2 * math.pi * 1.00 * t)
-        + 0.80 * math.sin(2 * math.pi * 2.00 * t)
-        + 0.55 * math.sin(2 * math.pi * 3.00 * t)
-        + 0.40 * math.sin(2 * math.pi * 4.00 * t)
-        + 0.25 * math.sin(2 * math.pi * 5.00 * t)
-        + 0.15 * math.sin(2 * math.pi * 6.00 * t)
+        1.00  * math.sin(2 * math.pi * 1.00 * t)   # n=1: sin(pi/8)/1
+        + 0.92  * math.sin(2 * math.pi * 2.00 * t)   # n=2: sin(2pi/8)/2
+        + 0.81  * math.sin(2 * math.pi * 3.00 * t)   # n=3: sin(3pi/8)/3
+        + 0.65  * math.sin(2 * math.pi * 4.00 * t)   # n=4: sin(4pi/8)/4
+        + 0.48  * math.sin(2 * math.pi * 5.00 * t)   # n=5: sin(5pi/8)/5
+        + 0.31  * math.sin(2 * math.pi * 6.00 * t)   # n=6: sin(6pi/8)/6
     )
-    return v / 3.15
+    return v / 4.17
 
 
 # -------------------------------------------------
@@ -182,26 +187,35 @@ def piano_fn(t):
         + 0.10 * math.sin(2 * math.pi * 6.13 * t)
         + 0.06 * math.sin(2 * math.pi * 7.20 * t)
     )
-    return v / 2.56
+    return v / 3.15
 
 
 # -------------------------------------------------
-# GUITAR
+# GUITAR (classical, nylon-string)
 # -------------------------------------------------
-# Guitar has a strong fundamental and relatively
-# strong low-order harmonics, but less high-frequency
-# energy than a sawtooth.
-
+# Harmonic amplitudes computed the same way as the Pluck instrument
+# (Young's plucked-string theorem: amplitude of harmonic n is
+# proportional to sin(n*pi*p)/n for pluck position p), but calibrated
+# for classical fingerstyle technique rather than a pick: nylon
+# strings are lower-tension and plucked with the fingers closer to
+# mid-string (p ~ 1/5, roughly over the soundhole) rather than near
+# the bridge like a pick attack. That combination is what physically
+# produces the warmer, mellower, less bright tone nylon strings are
+# known for, versus a steel-string's brighter pick attack.
+# Computed for p = 1/5:
 def guitar_fn(t):
     v = (
-        1.00 * math.sin(2 * math.pi * 1.00 * t)
-        + 0.70 * math.sin(2 * math.pi * 2.00 * t)
-        + 0.42 * math.sin(2 * math.pi * 3.00 * t)
-        + 0.25 * math.sin(2 * math.pi * 4.00 * t)
-        + 0.15 * math.sin(2 * math.pi * 5.00 * t)
-        + 0.08 * math.sin(2 * math.pi * 6.00 * t)
+        1.00 * math.sin(2 * math.pi * 1.00 * t)   # n=1: sin(pi/5)/1
+        + 0.81 * math.sin(2 * math.pi * 2.00 * t)   # n=2: sin(2pi/5)/2
+        + 0.54 * math.sin(2 * math.pi * 3.00 * t)   # n=3: sin(3pi/5)/3
+        + 0.25 * math.sin(2 * math.pi * 4.00 * t)   # n=4: sin(4pi/5)/4
+        # n=5 omitted: plucking at exactly the 1/5 point places a node
+        # right at the pluck location, so the 5th harmonic physically
+        # cannot be excited -- this isn't a simplification, it's what
+        # a real p=1/5 pluck does.
+        + 0.17 * math.sin(2 * math.pi * 6.00 * t)   # n=6: sin(6pi/5)/6
     )
-    return v / 2.60
+    return v / 2.77
 
 
 # -------------------------------------------------
@@ -219,58 +233,72 @@ def bass_fn(t):
     )
     return v / 1.80
 
-
 # -------------------------------------------------
 # FLUTE
 # -------------------------------------------------
-# Flute is mostly fundamental with very weak
-# upper harmonics.
-
+# Flute has the "purest" tone of any orchestral instrument -- it's
+# genuinely poor in harmonics, just enough above the fundamental to
+# avoid sounding like a bare sine wave. Keep this weak; don't be
+# tempted to add more/louder harmonics to make it sound "richer" --
+# that's not what makes a flute sound like a flute.
 def flute_fn(t):
     v = (
-        1.00 * math.sin(2 * math.pi * 1.00 * t)
-        + 0.12 * math.sin(2 * math.pi * 2.00 * t)
-        + 0.06 * math.sin(2 * math.pi * 3.00 * t)
-        + 0.025 * math.sin(2 * math.pi * 4.00 * t)
+        1.00  * math.sin(2 * math.pi * 1.00 * t)
+        + 0.15  * math.sin(2 * math.pi * 2.00 * t)
+        + 0.07  * math.sin(2 * math.pi * 3.00 * t)
+        + 0.03  * math.sin(2 * math.pi * 4.00 * t)
+        + 0.015 * math.sin(2 * math.pi * 5.00 * t)
+        + 0.008 * math.sin(2 * math.pi * 6.00 * t)
     )
-    return v / 1.21
-
+    return v / 1.273
 
 # -------------------------------------------------
 # CLARINET
 # -------------------------------------------------
-# Clarinet is characterized by strong ODD harmonics.
-# This is substantially different from a flute.
-
+# Clarinet is a closed cylindrical pipe, which is why it's dominated
+# by ODD harmonics (1, 3, 5...) rather than the full series. Weighted
+# here toward the chalumeau (low-register) balance, where the
+# fundamental carries the majority of the energy and upper harmonics
+# are comparatively weak -- this is what gives the low register its
+# characteristic warm, hollow, bass-leaning quality, versus the
+# brighter, more even harmonic spread of the upper clarion register.
 def clarinet_fn(t):
     v = (
-        1.00 * math.sin(2 * math.pi * 1.00 * t)
-        + 0.72 * math.sin(2 * math.pi * 3.00 * t)
-        + 0.48 * math.sin(2 * math.pi * 5.00 * t)
-        + 0.30 * math.sin(2 * math.pi * 7.00 * t)
-        + 0.18 * math.sin(2 * math.pi * 9.00 * t)
+        1.00 * math.sin(2 * math.pi * 1.00 * t)   # fundamental -- dominant, chalumeau-style
+        + 0.08 * math.sin(2 * math.pi * 2.00 * t)   # faint even harmonic -- woody warmth
+        + 0.55 * math.sin(2 * math.pi * 3.00 * t)   # strong odd -- core color, slightly reduced
+        + 0.10 * math.sin(2 * math.pi * 4.00 * t)   # faint even harmonic -- roundness
+        + 0.30 * math.sin(2 * math.pi * 5.00 * t)   # odd -- reduced from before
+        + 0.14 * math.sin(2 * math.pi * 7.00 * t)   # odd -- de-emphasized
+        + 0.08 * math.sin(2 * math.pi * 9.00 * t)   # odd -- de-emphasized upper shimmer
     )
-    return v / 2.68
-
+    return v / 2.25
 
 # -------------------------------------------------
-# BRASS
+# TRUMPET
 # -------------------------------------------------
-# Brass instruments have substantial upper harmonics.
-# This gives a much brighter, more aggressive sound.
-
-def brass_fn(t):
+# Trumpets are among the "brightest" brass instruments (alongside
+# trombones) because of their cylindrical bore right after the
+# mouthpiece -- this permits strong nonlinear wave-steepening as the
+# sound travels down the tube, which pushes energy into high
+# harmonics far more than a conical-bore instrument like a flugelhorn
+# or euphonium. That's why this spectrum extends further and stays
+# louder into the upper harmonics than a generic/mellower brass patch
+# would.
+def trumpet_fn(t):
     v = (
         1.00 * math.sin(2 * math.pi * 1.00 * t)
-        + 0.78 * math.sin(2 * math.pi * 2.00 * t)
-        + 0.62 * math.sin(2 * math.pi * 3.00 * t)
-        + 0.48 * math.sin(2 * math.pi * 4.00 * t)
-        + 0.35 * math.sin(2 * math.pi * 5.00 * t)
-        + 0.25 * math.sin(2 * math.pi * 6.00 * t)
-        + 0.17 * math.sin(2 * math.pi * 7.00 * t)
-        + 0.12 * math.sin(2 * math.pi * 8.00 * t)
+        + 0.85 * math.sin(2 * math.pi * 2.00 * t)
+        + 0.72 * math.sin(2 * math.pi * 3.00 * t)
+        + 0.58 * math.sin(2 * math.pi * 4.00 * t)
+        + 0.46 * math.sin(2 * math.pi * 5.00 * t)
+        + 0.36 * math.sin(2 * math.pi * 6.00 * t)
+        + 0.27 * math.sin(2 * math.pi * 7.00 * t)
+        + 0.20 * math.sin(2 * math.pi * 8.00 * t)
+        + 0.14 * math.sin(2 * math.pi * 9.00 * t)
+        + 0.09 * math.sin(2 * math.pi * 10.00 * t)
     )
-    return v / 3.77
+    return v / 4.67
 
 
 # -------------------------------------------------
@@ -309,7 +337,7 @@ WAVETABLES = {
     "Bass":     make_table(bass_fn),
     "Flute":    make_table(flute_fn),
     "Clarinet": make_table(clarinet_fn),
-    "Brass":    make_table(brass_fn),
+    "Trumpet":    make_table(trumpet_fn),
     "Strings":  make_table(strings_fn),
 }
 
@@ -326,18 +354,18 @@ ENVELOPES = {
     "Pulse":    (5,   60, 0.75, 120),
 
     # Instruments
-    "Organ":    (5,   30, 0.95,  60),
-    "Bell":     (2,  400, 0.20, 600),
-    "Pluck":    (2,  250, 0.05, 300),
+    "Organ":    (12, 40, 0.97,  400),
+    "Bell":     (1,  400, 0.22, 1900),
+    "Pluck":    (2,  200, 0.09, 90), 
 
-    "Piano":    (2,  450, 0.12, 450),
-    "Guitar":   (3,  300, 0.10, 500),
-    "Bass":     (5,  150, 0.80, 250),
+    "Piano":    (2,  450, 0.12, 450), 
+    "Guitar":   (3,  100, 0.25, 800),#o
+    "Bass":     (3,  190, 0.15, 90), 
 
-    "Flute":    (80, 100, 0.90, 250),
-    "Clarinet": (30,  80, 0.88, 180),
-    "Brass":    (30, 100, 0.82, 220),
-    "Strings":  (120, 180, 0.88, 400),
+    "Flute":    (90, 100, 0.92, 240),
+    "Clarinet": (20,  45, 0.94, 150),
+    "Trumpet":    (25, 50, 0.85, 160), #o
+    "Strings":  (140, 100, 0.92, 550),
 }
 
 
