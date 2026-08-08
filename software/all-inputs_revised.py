@@ -4,24 +4,25 @@ SYNTH-V2 -- MERGED PICO 2 W MUSIC CONTROLLER
 This combines two things that used to live in separate scripts:
 
   1) The UI layer: a 3x4 matrix keypad, an OLED status display, a volume
-     potentiometer, and two switchable "states" (patches) that each
-     remember their own octave / key / instrument / volume.
+     potentiometer, and two switchable "profiles" (patches) that each
+     remember their own octave / key / sound / volume.
 
   2) The audio layer: a real-time I2S wavetable synth with per-voice
-     ADSR envelopes and a library of instrument wavetables (Sine,
-     Square, Organ, Bell, Piano, Guitar, Flute, Trumpet, Strings, etc).
+     ADSR envelopes and a library of instrument wavetables (Organ,
+     Bell, Pluck, Piano, Guitar, Bass, Flute, Clarinet, Trumpet,
+     Strings).
 
 The 8 physical note buttons now trigger *real audio* instead of just
-updating a boolean array. Whichever state (state1 or state2) is active
-determines:
+updating a boolean array. Whichever profile (profile1 or profile2) is
+active determines:
   - the 8-note major scale the buttons play, built live from that
-    state's "key" + "octave"
-  - which wavetable/ADSR envelope is used (that state's "sample")
-  - the overall output volume (that state's "volume")
+    profile's "key" + "octave"
+  - which wavetable/ADSR envelope is used (that profile's "sound")
+  - the overall output volume (that profile's "volume")
 
-Press '*' on the keypad to swap which state/patch is currently
+Press '*' on the keypad to swap which profile is currently
 controlling the 8 buttons and the potentiometer. The keypad always
-edits whichever state is currently active.
+edits whichever profile is currently active.
 
 PIN MAP
 -------
@@ -140,18 +141,32 @@ CHROMATIC_SCALE = [
     "F#", "G", "G#", "A", "A#", "B"
 ]
 
+ENHARMONIC_MAP = {
+    "Db": "C#",
+    "Eb": "D#",
+    "Gb": "F#",
+    "Ab": "G#",
+    "Bb": "A#",
+    "Cb": "B",
+    "Fb": "E",
+    "E#": "F",
+    "B#": "C"
+}
+
+def normalize_key(key):
+    return ENHARMONIC_MAP.get(key, key)
 
 
 def increment_key(current_key):
-
-    idx = CHROMATIC_SCALE.index(current_key)
+    normalized = normalize_key(current_key)
+    idx = CHROMATIC_SCALE.index(normalized)
     next_idx = (idx + 1) % len(CHROMATIC_SCALE)
     return CHROMATIC_SCALE[next_idx]
 
 
 def decrement_key(current_key):
-
-    idx = CHROMATIC_SCALE.index(current_key)
+    normalized = normalize_key(current_key)
+    idx = CHROMATIC_SCALE.index(normalized)
     prev_idx = (idx - 1) % len(CHROMATIC_SCALE)
     return CHROMATIC_SCALE[prev_idx]
 
@@ -160,8 +175,8 @@ def decrement_key(current_key):
 # OCTAVE
 # ============================================================
 
-MIN_OCTAVE = 2
-MAX_OCTAVE = 6
+MIN_OCTAVE = 1
+MAX_OCTAVE = 8
 
 
 def increment_octave(current_octave):
@@ -186,7 +201,7 @@ def build_scale_freqs(key, octave):
     major scale starting at `key` in `octave`. Standard equal
     temperament, A4 = 440Hz."""
 
-    root_idx = CHROMATIC_SCALE.index(key)
+    root_idx = CHROMATIC_SCALE.index(normalize_key(key))
     freqs = []
 
     for step in MAJOR_SCALE_STEPS:
@@ -216,26 +231,6 @@ def make_table(fn):
     )
 
 
-def sine_fn(t):
-    return math.sin(2 * math.pi * t)
-
-
-def square_fn(t):
-    return 1.0 if t < 0.5 else -1.0
-
-
-def saw_fn(t):
-    return 2.0 * t - 1.0
-
-
-def triangle_fn(t):
-    return 4.0 * abs(t - 0.5) - 1.0
-
-
-def pulse25_fn(t):
-    return 1.0 if t < 0.25 else -1.0
-
-
 def organ_fn(t):
     # Fuller principal + mixture chorus: more ranks stacked than a basic
     # 8'+4'+2' combo.
@@ -247,7 +242,7 @@ def organ_fn(t):
         + 0.25 * math.sin(2 * math.pi * 5.00 * t)    # 1⅗'  tierce
         + 0.20 * math.sin(2 * math.pi * 6.00 * t)    # 1⅓'  larigot
         + 0.15 * math.sin(2 * math.pi * 8.00 * t)    # 1'   twenty-second
-        + 0.10 * math.sin(2 * math.pi * 9.00 * t)    # mixture rank
+        + 0.10 * math.sin(2 * math.pi * 9.00 * t)   # mixture rank
         + 0.08 * math.sin(2 * math.pi * 10.00 * t)   # mixture rank
         + 0.05 * math.sin(2 * math.pi * 12.00 * t)   # mixture top rank
     )
@@ -370,12 +365,6 @@ def strings_fn(t):
 
 
 WAVETABLES = {
-    "Sine":     make_table(sine_fn),
-    "Square":   make_table(square_fn),
-    "Sawtooth": make_table(saw_fn),
-    "Triangle": make_table(triangle_fn),
-    "Pulse":    make_table(pulse25_fn),
-
     "Organ":    make_table(organ_fn),
     "Bell":     make_table(bell_fn),
     "Pluck":    make_table(pluck_fn),
@@ -393,14 +382,6 @@ WAVETABLES = {
 # (attack_ms, decay_ms, sustain_level, release_ms)
 
 ENVELOPES = {
-    # Synth sounds
-    "Sine":     (10,  80, 0.85, 150),
-    "Square":   (5,   60, 0.80, 100),
-    "Sawtooth": (15, 120, 0.75, 200),
-    "Triangle": (10, 100, 0.85, 180),
-    "Pulse":    (5,   60, 0.75, 120),
-
-    # Instruments
     "Organ":    (12, 40, 0.97,  400),
     "Bell":     (1,  400, 0.22, 1900),
     "Pluck":    (2,  200, 0.09, 90),
@@ -415,52 +396,56 @@ ENVELOPES = {
     "Strings":  (140, 100, 0.92, 550),
 }
 
-# Explicit tuple, NOT list(ENVELOPES.keys()) -- MicroPython does not
-# preserve dict insertion order, so the cycle order would be scrambled
-# and unrehearsable. Must match the ENVELOPES keys exactly.
-SAMPLE_LIST = (
-    "Sine", "Square", "Sawtooth", "Triangle", "Pulse",
-    "Organ", "Bell", "Pluck", "Piano", "Guitar",
-    "Bass", "Flute", "Clarinet", "Trumpet", "Strings"
-)
+SOUND_LIST = list(ENVELOPES.keys())
+
+DEFAULT_SOUND = SOUND_LIST[0]
 
 
-def increment_sample(current_sample):
-    idx = SAMPLE_LIST.index(current_sample)
-    next_idx = (idx + 1) % len(SAMPLE_LIST)
-    return SAMPLE_LIST[next_idx]
+def increment_sound(current_sound):
+    idx = SOUND_LIST.index(current_sound)
+    next_idx = (idx + 1) % len(SOUND_LIST)
+    return SOUND_LIST[next_idx]
 
 
-def decrement_sample(current_sample):
-    idx = SAMPLE_LIST.index(current_sample)
-    prev_idx = (idx - 1) % len(SAMPLE_LIST)
-    return SAMPLE_LIST[prev_idx]
+def decrement_sound(current_sound):
+    idx = SOUND_LIST.index(current_sound)
+    prev_idx = (idx - 1) % len(SOUND_LIST)
+    return SOUND_LIST[prev_idx]
 
 
 # ============================================================
-# INSTRUMENT STATES (PATCHES)
+# PROFILES (PATCHES)
 # ============================================================
 
-state1 = {
+profile1 = {
     "octave": 4,
     "key": "C",
-    "sample": "Sine",
+    "sound": "Organ",
     "volume": 75,
     "keys": [False] * 8
 }
 
-state2 = {
+profile2 = {
     "octave": 5,
     "key": "F",
-    "sample": "Sawtooth",
+    "sound": "Guitar",
     "volume": 30,
     "keys": [False] * 8
 }
 
-states = [state1, state2]
+profile3 = {
+    "octave": 3,
+    "key": "G",
+    "sound": "Piano",
+    "volume": 50,
+    "keys": [False] * 8
+}
 
-# 0 = state1
-# 1 = state2
+profiles = [profile1, profile2, profile3]
+
+# 0 = profile1
+# 1 = profile2
+# 2 = profile3
 active_index = 0
 
 
@@ -471,7 +456,7 @@ active_index = 0
 BUTTON_PINS = [15, 14, 13, 12, 11, 10, 9, 8]
 buttons = [Pin(p, Pin.IN, Pin.PULL_UP) for p in BUTTON_PINS]
 
-# Tracks the REAL hardware state of the buttons (not per-state) so the
+# Tracks the REAL hardware state of the buttons (not per-profile) so the
 # audio engine always knows what's actually pressed right now.
 previous_keys = [False] * len(buttons)
 
@@ -484,23 +469,22 @@ adc = ADC(26)
 previous_volume = -1
 
 # ---- Volume pot calibration ----
-# Pots rarely swing the full 0-65535 ADC range (wiring resistance,
-# pot tolerance). Hardcoding 0-65535 as endpoints squashes the real
-# range into part of it -- the "bottom never reads 0 / halfway
-# already reads 100" symptom.
+# Slide pots rarely actually swing the full 0-65535 ADC range in
+# practice (wiring resistance, the pot's own tolerance, etc). If you
+# hardcode 0-65535 as the endpoints, whatever the pot's *real* range
+# turns out to be gets squashed into a smaller chunk of that -- which
+# is exactly the "bottom never reads 0" / "halfway already reads 100"
+# symptom.
 #
-# So we self-calibrate: lowest and highest raw readings ever seen
-# become the 0% and 100% endpoints. After power-on, sweep the pot
-# end to end once to calibrate.
+# Instead we self-calibrate: the lowest and highest raw readings ever
+# seen become the 0% and 100% endpoints, so the whole physical slide
+# length maps to the whole 0-100 range with nothing wasted.
+#
+# After power-on, slide it all the way down then all the way up once
+# to calibrate. Until that first full sweep, readings are
+# stretched/clamped from whatever range has been seen so far.
 adc_min = 65535
 adc_max = 0
-
-# The pot must show at least this much travel before we trust those
-# endpoints. Below this, the "range" is just ADC noise a few counts
-# wide, and dividing by it makes volume jump randomly between 0
-# and 100. 8000 is ~12% of full scale: well above noise, well
-# below any real pot's travel.
-MIN_ADC_SPAN = 8000
 
 
 # ============================================================
@@ -525,7 +509,7 @@ display = ssd1306.SSD1306_I2C(
 # ============================================================
 
 SAMPLE_RATE = 11025
-BUF_SAMPLES = 512
+BUF_SAMPLES = 1024
 
 audio = I2S(
     0,
@@ -536,7 +520,7 @@ audio = I2S(
     bits=16,
     format=I2S.MONO,
     rate=SAMPLE_RATE,
-    ibuf=4096,
+    ibuf=8192,
 )
 
 
@@ -565,12 +549,12 @@ class Voice:
         self.sustain_level = 0.0
         self.release_step = 0.0
 
-    def note_on(self, freq, instrument):
-        self.table = WAVETABLES.get(instrument, WAVETABLES["Sine"])
+    def note_on(self, freq, sound):
+        self.table = WAVETABLES.get(sound, WAVETABLES[DEFAULT_SOUND])
         self.phase = 0.0
         self.phase_inc = freq * TABLE_LEN / SAMPLE_RATE
 
-        a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(instrument, ENVELOPES["Sine"])
+        a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(sound, ENVELOPES[DEFAULT_SOUND])
         a_samples = max(1, int(a_ms * SAMPLE_RATE / 1000))
         d_samples = max(1, int(d_ms * SAMPLE_RATE / 1000))
         r_samples = max(1, int(r_ms * SAMPLE_RATE / 1000))
@@ -656,9 +640,8 @@ def render_voice(v, mix_buf, n_samples):
 @micropython.native
 def generate_block(volume_pct):
     """Render one audio block using the given 0-100 volume percent
-    (comes from whichever state is currently active)."""
-    v = volume_pct / 100.0
-    vol = v * v / 3.0     # square law + chord headroom
+    (comes from whichever profile is currently active)."""
+    vol = volume_pct / 100.0
 
     i = 0
     while i < BUF_SAMPLES:
@@ -684,16 +667,16 @@ def generate_block(volume_pct):
 # OLED DISPLAY
 # ============================================================
 
-def displayState(state):
+def displayProfile(profile):
 
     display.fill(0)
 
     # -------------------------
-    # State
+    # Profile
     # -------------------------
 
     display.text(
-        "State: " + str(active_index + 1),
+        "Profile: " + str(active_index + 1),
         0,
         0
     )
@@ -703,25 +686,25 @@ def displayState(state):
     # -------------------------
 
     display.text(
-        "Oct: " + str(state["octave"]),
+        "Oct: " + str(profile["octave"]),
         0,
         8
     )
 
     display.text(
-        "Key: " + state["key"],
+        "Key: " + profile["key"],
         64,
         8
     )
 
     # -------------------------
-    # Sample
+    # Sound
     # -------------------------
 
-    sample_name = state["sample"]
+    sound_name = profile["sound"]
 
     display.text(
-        "Sample: " + sample_name,
+        "Sound: " + sound_name,
         0,
         16
     )
@@ -731,7 +714,7 @@ def displayState(state):
     # -------------------------
 
     display.text(
-        "Volume: " + str(state["volume"]),
+        "Volume: " + str(profile["volume"]),
         0,
         24
     )
@@ -748,7 +731,7 @@ def displayState(state):
 
     key_string = "".join(
         "1" if key else "0"
-        for key in state["keys"]
+        for key in profile["keys"]
     )
 
     display.text(
@@ -774,7 +757,7 @@ def displayState(state):
 # INITIAL DISPLAY
 # ============================================================
 
-displayState(states[active_index])
+displayProfile(profiles[active_index])
 
 
 # ============================================================
@@ -788,13 +771,13 @@ print("  1 = Key +")
 print("  4 = Key -")
 print("  2 = Octave +")
 print("  5 = Octave -")
-print("  3 = Sample +")
-print("  6 = Sample -")
-print("  * = Switch state")
+print("  3 = Sound +")
+print("  6 = Sound -")
+print("  * = Switch profile")
 print("")
 print("Instrument buttons play a live major scale built from the")
-print("active state's key + octave, using its selected sample/")
-print("instrument and volume:")
+print("active profile's key + octave, using its selected sound")
+print("and volume:")
 print("  GPIO15 -> button 1")
 print("  GPIO14 -> button 2")
 print("  GPIO13 -> button 3")
@@ -809,8 +792,8 @@ print("OLED SDA: GPIO4")
 print("OLED SCL: GPIO5")
 print("I2S sck/ws/sd: GPIO16/17/18")
 print("")
-print("Active state: state1")
-print(json.dumps(states[active_index]))
+print("Active profile: profile1")
+print(json.dumps(profiles[active_index]))
 print("")
 
 
@@ -821,7 +804,7 @@ print("")
 while True:
 
     changed = False
-    active_state = states[active_index]
+    active_profile = profiles[active_index]
 
     # ========================================================
     # 8 NOTE BUTTONS -> TRIGGER VOICES
@@ -835,7 +818,7 @@ while True:
         # only once per batch of button changes (cheap either way,
         # but no sense doing it 8 times).
         scale_freqs = build_scale_freqs(
-            active_state["key"], active_state["octave"]
+            active_profile["key"], active_profile["octave"]
         )
 
         for i in range(NUM_VOICES):
@@ -843,11 +826,11 @@ while True:
             was_pressed = previous_keys[i]
 
             if pressed and not was_pressed:
-                voices[i].note_on(scale_freqs[i], active_state["sample"])
+                voices[i].note_on(scale_freqs[i], active_profile["sound"])
             elif was_pressed and not pressed:
                 voices[i].note_off()
 
-        active_state["keys"] = raw_keys[:]
+        active_profile["keys"] = raw_keys[:]
         previous_keys = raw_keys[:]
         changed = True
 
@@ -857,8 +840,9 @@ while True:
 
     total = 0
 
-    # Average a few ADC readings with microsecond (not millisecond)
-    # delays so this doesn't eat the audio block's timing budget.
+    # Average a handful of ADC readings with short microsecond delays
+    # (not millisecond sleeps) so this doesn't eat into the audio
+    # block's timing budget.
     for _ in range(4):
         total += adc.read_u16()
         time.sleep_us(200)
@@ -872,15 +856,11 @@ while True:
     if raw_volume > adc_max:
         adc_max = raw_volume
 
-    span = adc_max - adc_min
-
-    if span >= MIN_ADC_SPAN:
-        # Calibrated: map the pot's real travel to 0-100
-        volume = round((raw_volume - adc_min) / span * 100)
+    # Map the CALIBRATED range to 0-100, not a hardcoded 0-65535
+    if adc_max > adc_min:
+        volume = round((raw_volume - adc_min) / (adc_max - adc_min) * 100)
     else:
-        # Not swept yet -- fall back to the nominal full range
-        volume = round(raw_volume / 65535 * 100)
-
+        volume = 0
     volume = max(0, min(100, volume))
 
     # ========================================================
@@ -889,12 +869,12 @@ while True:
 
     if previous_volume == -1:
         previous_volume = volume
-        active_state["volume"] = volume
+        active_profile["volume"] = volume
         changed = True
 
     elif abs(volume - previous_volume) >= 2:
         previous_volume = volume
-        active_state["volume"] = volume
+        active_profile["volume"] = volume
         changed = True
 
     # ========================================================
@@ -911,77 +891,77 @@ while True:
         # KEY UP
         # ----------------------------------------------------
         if pressed_key == "1":
-            active_state["key"] = increment_key(active_state["key"])
+            active_profile["key"] = increment_key(active_profile["key"])
             changed = True
             print(
-                "state" + str(active_index + 1)
-                + " key +: " + active_state["key"]
+                "profile" + str(active_index + 1)
+                + " key +: " + active_profile["key"]
             )
 
         # ----------------------------------------------------
         # KEY DOWN
         # ----------------------------------------------------
         elif pressed_key == "4":
-            active_state["key"] = decrement_key(active_state["key"])
+            active_profile["key"] = decrement_key(active_profile["key"])
             changed = True
             print(
-                "state" + str(active_index + 1)
-                + " key -: " + active_state["key"]
+                "profile" + str(active_index + 1)
+                + " key -: " + active_profile["key"]
             )
 
         # ----------------------------------------------------
         # OCTAVE UP
         # ----------------------------------------------------
         elif pressed_key == "2":
-            active_state["octave"] = increment_octave(active_state["octave"])
+            active_profile["octave"] = increment_octave(active_profile["octave"])
             changed = True
             print(
-                "state" + str(active_index + 1)
-                + " octave +: " + str(active_state["octave"])
+                "profile" + str(active_index + 1)
+                + " octave +: " + str(active_profile["octave"])
             )
 
         # ----------------------------------------------------
         # OCTAVE DOWN
         # ----------------------------------------------------
         elif pressed_key == "5":
-            active_state["octave"] = decrement_octave(active_state["octave"])
+            active_profile["octave"] = decrement_octave(active_profile["octave"])
             changed = True
             print(
-                "state" + str(active_index + 1)
-                + " octave -: " + str(active_state["octave"])
+                "profile" + str(active_index + 1)
+                + " octave -: " + str(active_profile["octave"])
             )
 
         # ----------------------------------------------------
-        # SAMPLE UP
+        # SOUND UP
         # ----------------------------------------------------
         elif pressed_key == "3":
-            active_state["sample"] = increment_sample(active_state["sample"])
+            active_profile["sound"] = increment_sound(active_profile["sound"])
             changed = True
             print(
-                "state" + str(active_index + 1)
-                + " sample +: " + active_state["sample"]
+                "profile" + str(active_index + 1)
+                + " sound +: " + active_profile["sound"]
             )
 
         # ----------------------------------------------------
-        # SAMPLE DOWN
+        # SOUND DOWN
         # ----------------------------------------------------
         elif pressed_key == "6":
-            active_state["sample"] = decrement_sample(active_state["sample"])
+            active_profile["sound"] = decrement_sound(active_profile["sound"])
             changed = True
             print(
-                "state" + str(active_index + 1)
-                + " sample -: " + active_state["sample"]
+                "profile" + str(active_index + 1)
+                + " sound -: " + active_profile["sound"]
             )
 
         # ----------------------------------------------------
-        # SWITCH ACTIVE STATE
+        # SWITCH ACTIVE PROFILE
         # ----------------------------------------------------
         elif pressed_key == "*":
-            active_index = (active_index + 1) % len(states)
+            active_index = (active_index + 1) % len(profiles)
             changed = True
-            active_state = states[active_index]
+            active_profile = profiles[active_index]
 
-            # Reset volume tracking so the newly active state's
+            # Reset volume tracking so the newly active profile's
             # stored volume isn't immediately overwritten by
             # wherever the pot physically happens to be sitting.
             # NOTE: previous_keys is intentionally NOT reset here --
@@ -989,9 +969,9 @@ while True:
             # engine, and resetting it would risk missing a
             # note-off (or firing a phantom note-on) for a button
             # that's still physically held down across the switch.
-            previous_volume = active_state["volume"]
+            previous_volume = active_profile["volume"]
 
-            print("Switched active state to state" + str(active_index + 1))
+            print("Switched active profile to profile" + str(active_index + 1))
 
         # ----------------------------------------------------
         # UNASSIGNED KEYS
@@ -1004,13 +984,14 @@ while True:
     # ========================================================
 
     if changed:
-        active_state = states[active_index]
-        displayState(active_state)
-        print("#" + json.dumps(active_state))
+        active_profile = profiles[active_index]
+        displayProfile(active_profile)
+        print(json.dumps(active_profile))
+        print("")
 
     # ========================================================
     # AUDIO RENDER -- runs every loop, unconditionally
     # ========================================================
 
-    generate_block(active_state["volume"])
+    generate_block(active_profile["volume"])
     audio.write(out_buf)
