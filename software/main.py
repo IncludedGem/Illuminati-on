@@ -6,7 +6,7 @@ button = Pin(10, Pin.IN, Pin.PULL_UP)
 
 state1 = {
     "octave": 4,
-    "key": "C#",
+    "key": "C",
     "sample": "Piano",
     "volume": 75,
     "keys": [True, False, True, False, False, False, True, False]
@@ -14,7 +14,7 @@ state1 = {
 
 state2 = {
     "octave": 5,
-    "key": "F",
+    "key": "G",
     "sample": "Violin",
     "volume": 30,
     "keys": [False, True, False, True, True, False, False, True]
