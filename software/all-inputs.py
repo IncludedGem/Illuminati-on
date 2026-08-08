@@ -107,7 +107,7 @@ def decrement_key(current_key):
 # OCTAVE
 # ============================================================
 
-MIN_OCTAVE = 0
+MIN_OCTAVE = 1
 MAX_OCTAVE = 8
 
 

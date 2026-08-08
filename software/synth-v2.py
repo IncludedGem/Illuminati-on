@@ -368,7 +368,6 @@ ENVELOPES = {
     "Strings":  (140, 100, 0.92, 550),
 }
 
-
 # Which instrument all 8 buttons use. Change this to any key above.
 INSTRUMENT = "Organ" 
 
