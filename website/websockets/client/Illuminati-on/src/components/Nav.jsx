@@ -44,15 +44,6 @@ export default function Nav() {
           ))}
         </nav>
 
-        <div className="hidden md:block">
-          <Link
-            to="/visualizer"
-            className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background transition-opacity hover:opacity-90"
-          >
-            Try it free
-          </Link>
-        </div>
-
         <button
           type="button"
           className="inline-flex h-9 w-9 items-center justify-center rounded-md text-foreground md:hidden"

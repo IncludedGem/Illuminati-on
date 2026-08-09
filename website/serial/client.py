@@ -1,51 +1,104 @@
 import asyncio
+import json
+
 import serial
 import websockets
-import json
-from datetime import datetime
 
 # Configuration
-SERIAL_PORT = 'COM24'  # Change to 'COM3' on Windows, '/dev/ttyUSB0' for other boards
+SERIAL_PORT = "COM7"  # Windows: COM3/COM7/... | macOS: /dev/tty.usbmodem* | Linux: /dev/ttyACM0
 BAUD_RATE = 115200
-WEBSOCKET_URL = 'ws://localhost:8765'
+WEBSOCKET_URL = "ws://localhost:8765"
+
+RECONNECT_DELAY = 1.5
 
 
-async def read_serial_and_send():
-    """Read from serial port and send to WebSocket server"""
+def open_serial():
+    """Open the serial port, retrying until the Pico shows up."""
+    while True:
+        try:
+            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+            print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
+            return ser
+        except serial.SerialException as e:
+            print(f"Serial error ({e}); retrying in {RECONNECT_DELAY}s...")
+            print(f"Check that the Pico is plugged in and that {SERIAL_PORT} is correct.")
+
+
+def read_line(ser):
+    """Blocking read of one line. Called via asyncio.to_thread.
+
+    readline() blocks for up to `timeout` seconds. Calling it directly from
+    the event loop stalls everything else -- including the websocket's ping
+    handling -- whenever the Pico goes quiet or sends a partial line.
+    """
     try:
-        # Open serial connection
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
-        # Connect to WebSocket server
-        async with websockets.connect(WEBSOCKET_URL) as websocket:
-            print(f"Connected to WebSocket server at {WEBSOCKET_URL}")
+        return ser.readline().decode("utf-8", errors="ignore").strip()
+    except serial.SerialException:
+        return None  # Port vanished (unplugged)
+
+
+def is_state_line(line):
+    """Cheap client-side filter so firmware debug prints don't hit the wire."""
+    stripped = line.lstrip("#").strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
+async def pump(ser, websocket):
+    """Forward serial state lines to the websocket until something breaks."""
+    while True:
+        line = await asyncio.to_thread(read_line, ser)
+
+        if line is None:
+            raise serial.SerialException("Serial port closed")
+        if not line:
+            continue  # readline() timed out; loop again
+
+        if not is_state_line(line):
+            print(f"Skipped: {line}")
+            continue
+
+        print(f"Serial: {line}")
+        await websocket.send(line)
+
+
+async def bridge():
+    ser = open_serial()
+    try:
+        while True:
             try:
-                while True:
-                    # Read line from serial
-                    if ser.in_waiting:
-                        line = ser.readline().decode('utf-8', errors='ignore').strip()
-                        if line:
-                            print(f"Serial: {line}")
-                            # Send to WebSocket server
-                            await websocket.send(line)
-                    # Small delay to prevent CPU spinning
-                    await asyncio.sleep(0.01)
-            except KeyboardInterrupt:
-                print("\nStopping...")
-            finally:
-                ser.close()
-                print("Serial connection closed")
-    except FileNotFoundError:
-        print(f"Error: Could not find serial port {SERIAL_PORT}")
-        print("Make sure your RPi Pico is connected and the port is correct.")
-    except serial.SerialException as e:
-        print(f"Serial Error: {e}")
-    except Exception as e:
-        print(f"Error: {e}")
+                async with websockets.connect(WEBSOCKET_URL) as websocket:
+                    print(f"Connected to WebSocket server at {WEBSOCKET_URL}")
+                    await pump(ser, websocket)
+
+            except (OSError, websockets.exceptions.WebSocketException) as e:
+                # Server not up yet, or it restarted mid-session.
+                print(f"WebSocket error ({e}); retrying in {RECONNECT_DELAY}s...")
+                await asyncio.sleep(RECONNECT_DELAY)
+
+            except serial.SerialException as e:
+                print(f"Serial error ({e}); reopening port...")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(RECONNECT_DELAY)
+                ser = open_serial()
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+        print("Serial connection closed")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(read_serial_and_send())
+        asyncio.run(bridge())
     except KeyboardInterrupt:
-        print("Interrupted")
+        print("\nStopping...")
