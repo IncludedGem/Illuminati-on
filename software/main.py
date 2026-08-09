@@ -37,6 +37,33 @@ KEYPAD
 Key 2 is free. It used to be reserved for loop undo/redo; that feature
 was scrapped, so reset (key 1) is now the only way to scrap a take.
 
+WHERE THE SOUND LIVES  (read this before "replacing the synth")
+---------------------------------------------------------------
+This file contains the ENGINE -- phase accumulation, envelope stepping,
+interpolation, mixing. It contains no tone decisions at all. Every
+spectrum and every ADSR setting lives in instruments.py, which now
+carries the standalone synth's recipes verbatim.
+
+That split matters because the two are independently swappable, and only
+one of them was ever the problem. The engine here is the integer form of
+the same algorithm the standalone ran in floats: same wavetable lookup,
+same ADSR shape, plus linear interpolation. It is strictly cheaper per
+sample and does not allocate. What made this build sound thin next to the
+standalone was the OLD instruments.py band-limiting every table down to
+two harmonics -- a tone problem, fixed in the tone file.
+
+Three things gate the sound before it reaches the DAC, in order. Check
+them in this order if it still sounds wrong:
+
+  1. the cutoff knob (GP27). The lowpass sits in front of everything, so
+     a low cutoff muffles the whole instrument no matter how rich the
+     table is. read_pot() now reports FULLY OPEN until that pot has been
+     swept far enough to calibrate, so an unwired or untouched GP27 can
+     no longer silently filter the set -- see POTS.
+  2. MIX_HEADROOM. The standalone was loud partly because it clipped on
+     any two-note chord; this divides down first so chords stay clean.
+     See the constant for the exact clip math.
+  3. the volume knob (GP26), square-law, so it feels linear.
 
 MODES
 -----
@@ -61,6 +88,15 @@ Only shrinking the queue does.
 
 The tradeoff: a smaller ibuf means less slack, so any single loop pass
 that overruns 16 ms produces an audible click. See SPIKE BUDGET.
+
+The standalone synth's settings (11025 Hz, BUF_SAMPLES 1024, ibuf 8192)
+are NOT portable here, and this is the reason: 1024/11025 is a 93 ms
+block and 8192 bytes is four more of them, so press-to-sound would be
+about 460 ms. That is fine for a script that only plays notes and
+unplayable for an instrument you perform on. It also breaks two things
+outright -- the drum .wav files are 12000 Hz and _load_wav_samples()
+raises at boot on any mismatch, and LOOP_SECONDS is budgeted against
+this rate. Keep the tone, not the timing.
 
 SPIKE BUDGET  (why chords used to cut out)
 ------------------------------------------
@@ -162,8 +198,9 @@ BUF_SAMPLES = const(256)
 # plays back cleaner, the samples were always fine and the DAC was being
 # starved. That is an underrun, not a synthesis problem.
 #
-# Nyquist here is 6000 Hz. See N_MAX in instruments.py for how the
-# wavetables are band-limited to suit it, and CUTOFF_MAX_HZ below.
+# Nyquist here is 6000 Hz. See N_MAX in instruments.py for why the
+# wavetables are NO LONGER band-limited to suit it, and CUTOFF_MAX_HZ
+# below.
 
 # Size the I2S buffer for double/triple buffering, NOT a big safety
 # margin -- every extra block of ibuf is another block of latency between
@@ -185,15 +222,15 @@ IBUF_BLOCKS = 3
 
 # Two int16 buffers (base take + overdub layer): 4 s costs 188 KB at this
 # rate (down from 250 KB at 16000 -- the rate drop pays for itself in
-# heap as well as CPU). The Looper backs off in half-second steps if that won't fit, so a
-# tight board gets a shorter loop rather than a traceback -- the startup
-# banner prints what it actually got.
+# heap as well as CPU). The Looper backs off in half-second steps if that
+# won't fit, so a tight board gets a shorter loop rather than a traceback
+# -- the startup banner prints what it actually got.
 LOOP_SECONDS = 4
 
 looper = loop.Looper(SAMPLE_RATE, BUF_SAMPLES, seconds=LOOP_SECONDS)
 
 # MUST be imported here, after the Looper -- see the allocation-order
-# warning at the top of instruments.py. This builds 15 wavetables.
+# warning at the top of instruments.py. This builds 14 wavetables.
 from instruments import (TABLE_LEN, WAVETABLES, ENVELOPES, DRUM_KIT_NAME,
                           shift_sample)
 
@@ -236,7 +273,7 @@ last_degree_index = None
 #
 # Forcing one-shot playback through Voice's phase/TABLE_LEN-wrap
 # machinery would need per-sample branches in render_voice's hot loop
-# for a case that doesn't apply to the other 14 instruments. Cheaper to
+# for a case that doesn't apply to the other 13 instruments. Cheaper to
 # give drums their own voice type (DrumVoice) and render function
 # (render_drum_voice), mixed into the same mix_buf.
 #
@@ -270,7 +307,12 @@ def _load_wav_samples(path):
     into the mix with no rate conversion and no channel handling, so a
     44.1 kHz or stereo file does not error, it just plays at the wrong
     pitch and half speed. That is a miserable thing to debug on stage
-    and cheap to catch here."""
+    and cheap to catch here.
+
+    Note the rate check is also what makes SAMPLE_RATE non-negotiable
+    without regenerating the kit: these wavs were rendered at 12000 Hz,
+    so dropping the project to 11025 to match the standalone synth would
+    raise here on kick.wav and never reach the main loop."""
     with open(path, "rb") as f:
         header = f.read(12)
         if header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
@@ -561,12 +603,23 @@ previous_volume = -1
 previous_cutoff = -1
 
 
-def read_pot(ch):
+def read_pot(ch, unswept_default=-1):
     """Return 0-100 for ADC channel index `ch`, using that channel's own
     learned calibration. Averages 4 reads: the deadband already swamps
     ADC noise for the reported value, but adc_min/adc_max latch onto
     extremes permanently, so one noise spike would widen a channel's
-    learned range for the rest of the set."""
+    learned range for the rest of the set.
+
+    `unswept_default`, if given (0-100), is what this channel reports
+    until it has actually been swept far enough to calibrate. Cutoff
+    passes 100 for it, and that is not cosmetic: the lowpass sits in
+    front of everything in the chain, and an UNWIRED or merely untouched
+    GP27 floats, so the raw fallback below would scale noise into an
+    arbitrary cutoff and quietly muffle the entire instrument. Failing
+    open means a miswired filter knob costs you the filter, not the
+    sound. Volume passes nothing and keeps the raw fallback, because for
+    volume the raw reading of a wired pot is already close to its true
+    position and jumping to a default would be the worse surprise."""
     a = adc_channels[ch]
     raw = (a.read_u16() + a.read_u16() + a.read_u16() + a.read_u16()) >> 2
 
@@ -579,8 +632,10 @@ def read_pot(ch):
     span = adc_max[ch] - adc_min[ch]
     if span >= MIN_ADC_SPAN:
         pct = round((raw - adc_min[ch]) / span * 100)
+    elif unswept_default >= 0:
+        return unswept_default           # not swept yet, fail safe
     else:
-        pct = round(raw / 65535 * 100)   # not swept yet
+        pct = round(raw / 65535 * 100)   # not swept yet, best guess
 
     return max(0, min(100, pct))
 
@@ -631,15 +686,21 @@ _RELEASE = const(4)
 # ---------------- Fixed-point scales for the voice render ----------------
 #
 # render_voice used to carry a float phase, a float envelope level, and a
-# float interpolation fraction. MicroPython boxes every float on the
-# heap, so the inner loop -- 256 iterations per voice per block, 2048
-# with 8 voices held -- was allocating constantly and running the slowest
-# arithmetic the interpreter has. That is what made CPU load track voice
-# count, and voice count is exactly the axis the garbling moved along.
+# float interpolation fraction -- the shape the standalone synth still
+# uses. MicroPython boxes every float on the heap, so the inner loop --
+# 256 iterations per voice per block, 2048 with 8 voices held -- was
+# allocating constantly and running the slowest arithmetic the
+# interpreter has. That is what made CPU load track voice count, and
+# voice count is exactly the axis the garbling moved along.
 #
-# Everything below is integer. No allocation, no GC pressure, and the
-# whole loop stays inside MicroPython's 31-bit small-int range (+-1.07e9)
-# so nothing silently promotes to a heap-allocated big int.
+# The standalone gets away with floats because it runs 1024-sample blocks
+# at 11025 Hz behind a 4-block ibuf: a 93 ms budget and ~460 ms of queue
+# to hide any overrun in. This build spends that latency on playability
+# instead, which only works if the render is cheap. So the arithmetic
+# below is integer -- SAME algorithm, same envelope shape, same tables,
+# no allocation, no GC pressure -- and the whole loop stays inside
+# MicroPython's 31-bit small-int range (+-1.07e9) so nothing silently
+# promotes to a heap-allocated big int.
 #
 # PHASE -- Q16.16. phase_inc = freq * TABLE_LEN * 65536 / SAMPLE_RATE.
 # Top note (octave 6, degree 7 = C7, 2093 Hz) gives ~2.9e6, far below
@@ -704,6 +765,11 @@ class Voice:
         # Float maths is fine HERE -- note_on runs once per keypress, not
         # once per sample. Everything it stores is an integer, so the
         # render loop never sees a float.
+        #
+        # The two .get() fallbacks land on "Sine", which is why
+        # instruments.py must always define it: a preset naming a sample
+        # that no longer exists gets a plain tone instead of a KeyError
+        # mid-set.
         self.table = WAVETABLES.get(instrument, WAVETABLES["Sine"])
         self.phase = 0
         # Q16.16 table steps per output sample. Stays well below
@@ -753,12 +819,42 @@ zero_buf = array("l", [0] * BUF_SAMPLES)
 silence_buf = array("h", [0] * BUF_SAMPLES)
 
 # Master headroom divisor. 8 voices at full scale sum to 256000 against a
-# 32000 output ceiling, so some division is mandatory; 3.0 targets a
-# roughly 3-note chord reaching full scale at volume 100. A loop playing
-# underneath adds as much again, so if you clip while looping, raise this
-# to 5.0 or 6.0 -- or just back the volume knob off, which is what a real
-# looper expects you to do.
-MIX_HEADROOM = 3.0
+# 32000 output ceiling, so some division is mandatory.
+#
+# 2.0, NOT 3.0. This is the knob that made the old build sound weak next
+# to the standalone synth, and it is worth being precise about why. The
+# standalone ran a flat 0.8 gain with no divisor at all, so ANY two notes
+# together clipped -- that hard clipping is a real part of why it sounds
+# loud and present rather than polite. 3.0 was set so a three-note chord
+# lands exactly at full scale and never clips, which is correct on paper
+# and about 7 dB quieter per note in the room, with the volume knob
+# already at maximum and nowhere left to go.
+#
+# 2.0 splits it: one note peaks at 16000 (half scale, plenty of room to
+# be heard), a two-note chord at full scale, and three or more clip
+# progressively the way the standalone did. If it distorts while a loop
+# is playing underneath -- the loop adds as much again on top of the live
+# voices -- go back to 3.0 or just back the volume knob off, which is
+# what a real looper expects you to do.
+MIX_HEADROOM = 2.0
+
+# Precomputed Q10 master gain, indexed by volume percent, same shape as
+# CUTOFF_TABLE below.
+#
+# Square law approximates how the ear hears loudness, so the pot feels
+# linear across its travel. Doing that as `x * x / MIX_HEADROOM` inside
+# generate_block meant a float multiply per sample in the output pass --
+# 256 boxed floats per block, in the one function most carefully written
+# to avoid exactly that. Table it once at boot and the whole audio path
+# is integer end to end.
+#
+# Q10 and not Q12, for the same range reason as the filter coefficient:
+# mb[i] reaches ~512000 with 8 voices plus loop playback, and
+# 512000 * 512 = 2.6e8 sits well inside the 31-bit small-int ceiling
+# while 4096-scale would not.
+VOL_TABLE = tuple(
+    int((p / 100.0) * (p / 100.0) / MIX_HEADROOM * 1024) for p in range(101)
+)
 
 
 # ---------------- One-pole lowpass ----------------
@@ -815,12 +911,14 @@ def render_voice(v, mix_buf, n_samples):
     are among the slowest operations in MicroPython and this loop runs
     256 times per voice per block.
 
-    LINEAR INTERPOLATION between the two nearest table samples. Real
-    notes step 10-70+ table entries per output sample, far coarser than
-    the table's 256-entry resolution, so nearest-neighbour lookup
-    produces a harsh clicking character that worsens with pitch.
-    Interpolating smooths that to the table's actual harmonic content for
-    one extra read, subtract, multiply and shift -- all integer now.
+    LINEAR INTERPOLATION between the two nearest table samples. This is
+    the one thing here the standalone does not do -- it takes
+    int(phase) % TABLE_LEN and reads the nearest entry. Real notes step
+    10-70+ table entries per output sample, far coarser than the table's
+    256-entry resolution, so nearest-neighbour lookup produces a harsh
+    clicking character that worsens with pitch. Interpolating smooths
+    that to the table's actual harmonic content for one extra read,
+    subtract, multiply and shift -- all integer. Keep it.
 
     idx1 wraps to 0 only when idx0 == TABLE_LEN - 1 (right before phase
     itself wraps), handled with one comparison rather than a modulo every
@@ -904,10 +1002,9 @@ def generate_block(volume_pct, cutoff_pct):
     ob = out_buf
     n = BUF_SAMPLES
 
-    x = volume_pct / 100.0
-    # Square law approximates how the ear hears loudness, so the pot
-    # feels linear across its travel.
-    vol = x * x / MIX_HEADROOM
+    # Q10 master gain, table lookup -- no float arithmetic anywhere in
+    # this function. See VOL_TABLE.
+    vol_q = VOL_TABLE[volume_pct]
 
     k = CUTOFF_TABLE[cutoff_pct]
     y = lp_state
@@ -939,7 +1036,7 @@ def generate_block(volume_pct, cutoff_pct):
     # Pass 2: master volume and clip.
     i = 0
     while i < n:
-        total = int(mb[i] * vol)
+        total = (mb[i] * vol_q) >> 10
         if total > 32000:
             total = 32000
         elif total < -32000:
@@ -1079,7 +1176,10 @@ while True:
         state["volume"] = volume
         changed = True
 
-    cutoff = read_pot(POT_CUTOFF)
+    # Reports 100 (filter open) until GP27 has actually been swept -- see
+    # read_pot. An unwired cutoff knob is now inaudible instead of
+    # muffling the whole set.
+    cutoff = read_pot(POT_CUTOFF, 100)
     if previous_cutoff == -1 or abs(cutoff - previous_cutoff) >= CUTOFF_DEADBAND:
         previous_cutoff = cutoff
         state["cutoff"] = cutoff
