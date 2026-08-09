@@ -4,8 +4,8 @@ SYNTH-V2 -- MERGED PICO 2 W MUSIC CONTROLLER
 This combines two things that used to live in separate scripts:
 
   1) The UI layer: a 3x4 matrix keypad, an OLED status display, a volume
-     potentiometer, and two switchable "profiles" (patches) that each
-     remember their own octave / key / sound / volume.
+     potentiometer, and three switchable "profiles" (patches) that each
+     remember their own octave / key / mode / sound / volume.
 
   2) The audio layer: a real-time I2S wavetable synth with per-voice
      ADSR envelopes and a library of instrument wavetables (Organ,
@@ -13,10 +13,9 @@ This combines two things that used to live in separate scripts:
      Strings).
 
 The 8 physical note buttons now trigger *real audio* instead of just
-updating a boolean array. Whichever profile (profile1 or profile2) is
-active determines:
-  - the 8-note major scale the buttons play, built live from that
-    profile's "key" + "octave"
+updating a boolean array. Whichever profile is active determines:
+  - the 8-note scale the buttons play (major or melodic minor), built
+    live from that profile's "key" + "octave" + "mode"
   - which wavetable/ADSR envelope is used (that profile's "sound")
   - the overall output volume (that profile's "volume")
 
@@ -188,32 +187,101 @@ def decrement_octave(current_octave):
 
 
 # ============================================================
-# NOTE FREQUENCY (key + octave -> 8-note major scale, one per button)
+# NOTE FREQUENCY (key + octave + mode -> per-button frequency)
 # ============================================================
 
-# Semitone offsets of a major scale, including the octave on top, so
-# an 8-button row plays a full root-to-root scale (e.g. C4..C5).
-MAJOR_SCALE_STEPS = [0, 2, 4, 5, 7, 9, 11, 12]
+# Semitone offsets, including the octave on top, so an 8-button row
+# spans a full root-to-root scale (e.g. C4..C5).
+
+# The 7 diatonic modes (Ionian..Locrian) plus harmonic minor -- each
+# one is just a fixed rotation/alteration of the major scale's steps.
+MODE_STEPS = {
+    "Major":          [0, 2, 4, 5, 7, 9, 11, 12],   # Ionian
+    "Dorian":         [0, 2, 3, 5, 7, 9, 10, 12],
+    "Phrygian":       [0, 1, 3, 5, 7, 8, 10, 12],
+    "Lydian":         [0, 2, 4, 6, 7, 9, 11, 12],
+    "Mixolydian":     [0, 2, 4, 5, 7, 9, 10, 12],
+    "Natural Minor":  [0, 2, 3, 5, 7, 8, 10, 12],   # Aeolian
+    "Locrian":        [0, 1, 3, 5, 6, 8, 10, 12],
+    "Harmonic Minor": [0, 2, 3, 5, 7, 8, 11, 12],
+}
+
+# Real melodic minor isn't one fixed scale -- the 6th and 7th degrees
+# depend on melodic direction:
+#   ascending:  raised 6th & 7th (strong leading tone into the octave)
+#   descending: natural 6th & 7th (same as natural minor, no leading tone)
+# Everything else (b3, root, octave) stays the same either direction.
+# It's handled separately from MODE_STEPS for that reason.
+MELODIC_MINOR_ASCENDING_STEPS = [0, 2, 3, 5, 7, 9, 11, 12]
+MELODIC_MINOR_DESCENDING_STEPS = MODE_STEPS["Natural Minor"]
+
+# Cycling order for the '#' key. "Melodic Minor" sits alongside the
+# fixed modes even though it's handled specially below.
+MODE_LIST = [
+    "Major",
+    "Natural Minor",
+    "Melodic Minor",
+    "Harmonic Minor",
+    "Dorian",
+    "Phrygian",
+    "Lydian",
+    "Mixolydian",
+    "Locrian",
+]
+
+# Short labels for the OLED (128px wide / 16 chars per line at the
+# default 8px font), so "Mode: <label>" always fits on one line.
+MODE_DISPLAY_LABEL = {
+    "Major":          "Major",
+    "Natural Minor":  "Nat Min",
+    "Melodic Minor":  "Mel Min",
+    "Harmonic Minor": "Harm Min",
+    "Dorian":         "Dorian",
+    "Phrygian":       "Phrygian",
+    "Lydian":         "Lydian",
+    "Mixolydian":     "Mixolyd",
+    "Locrian":        "Locrian",
+}
 
 
-def build_scale_freqs(key, octave):
-    """Return 8 frequencies (Hz), one per note button, forming a
-    major scale starting at `key` in `octave`. Standard equal
-    temperament, A4 = 440Hz."""
+def cycle_mode(current_mode):
+    """Advance to the next mode in MODE_LIST, wrapping around."""
+    idx = MODE_LIST.index(current_mode)
+    next_idx = (idx + 1) % len(MODE_LIST)
+    return MODE_LIST[next_idx]
+
+
+def scale_step_for_degree(mode, degree_index, ascending):
+    """Which semitone step to use for a given button/degree (0-7),
+    accounting for melodic-minor's direction-dependent 6th/7th."""
+    if mode == "Melodic Minor":
+        steps = (
+            MELODIC_MINOR_ASCENDING_STEPS
+            if ascending
+            else MELODIC_MINOR_DESCENDING_STEPS
+        )
+    else:
+        steps = MODE_STEPS.get(mode, MODE_STEPS["Major"])
+
+    return steps[degree_index]
+
+
+def note_frequency(key, octave, mode, degree_index, ascending):
+    """Frequency (Hz) for one button/degree (0-7), given the current
+    key, octave, mode, and whether the melodic line is currently
+    moving up or down. Standard equal temperament, A4 = 440Hz."""
 
     root_idx = CHROMATIC_SCALE.index(normalize_key(key))
-    freqs = []
+    step = scale_step_for_degree(mode, degree_index, ascending)
 
-    for step in MAJOR_SCALE_STEPS:
-        total = root_idx + step
-        note_octave = octave + total // 12
-        note_idx = total % 12
+    total = root_idx + step
+    note_octave = octave + total // 12
+    note_idx = total % 12
 
-        semitones_from_a4 = (note_octave - 4) * 12 + (note_idx - 9)
-        freq = 440.0 * (2 ** (semitones_from_a4 / 12))
-        freqs.append(freq)
+    semitones_from_a4 = (note_octave - 4) * 12 + (note_idx - 9)
+    freq = 440.0 * (2 ** (semitones_from_a4 / 12))
 
-    return freqs
+    return freq
 
 
 # ============================================================
@@ -420,6 +488,7 @@ def decrement_sound(current_sound):
 profile1 = {
     "octave": 4,
     "key": "C",
+    "mode": "Major",
     "sound": "Organ",
     "volume": 75,
     "keys": [False] * 8
@@ -428,6 +497,7 @@ profile1 = {
 profile2 = {
     "octave": 5,
     "key": "F",
+    "mode": "Major",
     "sound": "Guitar",
     "volume": 30,
     "keys": [False] * 8
@@ -436,6 +506,7 @@ profile2 = {
 profile3 = {
     "octave": 3,
     "key": "G",
+    "mode": "Major",
     "sound": "Piano",
     "volume": 50,
     "keys": [False] * 8
@@ -459,6 +530,12 @@ buttons = [Pin(p, Pin.IN, Pin.PULL_UP) for p in BUTTON_PINS]
 # Tracks the REAL hardware state of the buttons (not per-profile) so the
 # audio engine always knows what's actually pressed right now.
 previous_keys = [False] * len(buttons)
+
+# Tracks which button/degree (0-7) was most recently triggered, so
+# melodic minor can tell whether the line is currently moving up or
+# down and pick the raised (ascending) or natural (descending) 6th/7th
+# accordingly. None means "no direction yet" -- treated as ascending.
+last_degree_index = None
 
 
 # ============================================================
@@ -698,6 +775,19 @@ def displayProfile(profile):
     )
 
     # -------------------------
+    # Mode
+    # -------------------------
+
+    mode_name = profile["mode"]
+    mode_short = MODE_DISPLAY_LABEL.get(mode_name, mode_name)
+
+    display.text(
+        "Mode: " + mode_short,
+        0,
+        16
+    )
+
+    # -------------------------
     # Sound
     # -------------------------
 
@@ -706,7 +796,7 @@ def displayProfile(profile):
     display.text(
         "Sound: " + sound_name,
         0,
-        16
+        24
     )
 
     # -------------------------
@@ -716,7 +806,7 @@ def displayProfile(profile):
     display.text(
         "Volume: " + str(profile["volume"]),
         0,
-        24
+        32
     )
 
     # -------------------------
@@ -726,7 +816,7 @@ def displayProfile(profile):
     display.text(
         "Keys:",
         0,
-        32
+        40
     )
 
     key_string = "".join(
@@ -737,7 +827,7 @@ def displayProfile(profile):
     display.text(
         key_string,
         40,
-        32
+        40
     )
 
     # -------------------------
@@ -747,7 +837,7 @@ def displayProfile(profile):
     display.text(
         "12345678",
         40,
-        40
+        48
     )
 
     display.show()
@@ -773,6 +863,8 @@ print("  2 = Octave +")
 print("  5 = Octave -")
 print("  3 = Sound +")
 print("  6 = Sound -")
+print("  # = Cycle mode (Major, Natural Minor, Melodic Minor,")
+print("      Harmonic Minor, Dorian, Phrygian, Lydian, Mixolydian, Locrian)")
 print("  * = Switch profile")
 print("")
 print("Instrument buttons play a live major scale built from the")
@@ -814,19 +906,30 @@ while True:
 
     if raw_keys != previous_keys:
 
-        # Only build the scale when something actually changed, and
-        # only once per batch of button changes (cheap either way,
-        # but no sense doing it 8 times).
-        scale_freqs = build_scale_freqs(
-            active_profile["key"], active_profile["octave"]
-        )
-
         for i in range(NUM_VOICES):
             pressed = raw_keys[i]
             was_pressed = previous_keys[i]
 
             if pressed and not was_pressed:
-                voices[i].note_on(scale_freqs[i], active_profile["sound"])
+                # Direction of melodic motion: is this note higher or
+                # lower (by button/degree position) than the last one
+                # played? Only matters for Melodic Minor's 6th/7th,
+                # but it's cheap to always compute.
+                ascending = (
+                    last_degree_index is None or i > last_degree_index
+                )
+
+                freq = note_frequency(
+                    active_profile["key"],
+                    active_profile["octave"],
+                    active_profile["mode"],
+                    i,
+                    ascending,
+                )
+
+                voices[i].note_on(freq, active_profile["sound"])
+                last_degree_index = i
+
             elif was_pressed and not pressed:
                 voices[i].note_off()
 
@@ -892,6 +995,7 @@ while True:
         # ----------------------------------------------------
         if pressed_key == "1":
             active_profile["key"] = increment_key(active_profile["key"])
+            last_degree_index = None
             changed = True
             print(
                 "profile" + str(active_index + 1)
@@ -903,6 +1007,7 @@ while True:
         # ----------------------------------------------------
         elif pressed_key == "4":
             active_profile["key"] = decrement_key(active_profile["key"])
+            last_degree_index = None
             changed = True
             print(
                 "profile" + str(active_index + 1)
@@ -914,6 +1019,7 @@ while True:
         # ----------------------------------------------------
         elif pressed_key == "2":
             active_profile["octave"] = increment_octave(active_profile["octave"])
+            last_degree_index = None
             changed = True
             print(
                 "profile" + str(active_index + 1)
@@ -925,6 +1031,7 @@ while True:
         # ----------------------------------------------------
         elif pressed_key == "5":
             active_profile["octave"] = decrement_octave(active_profile["octave"])
+            last_degree_index = None
             changed = True
             print(
                 "profile" + str(active_index + 1)
@@ -954,6 +1061,18 @@ while True:
             )
 
         # ----------------------------------------------------
+        # TOGGLE / CYCLE MODE
+        # ----------------------------------------------------
+        elif pressed_key == "#":
+            active_profile["mode"] = cycle_mode(active_profile["mode"])
+            last_degree_index = None
+            changed = True
+            print(
+                "profile" + str(active_index + 1)
+                + " mode: " + active_profile["mode"]
+            )
+
+        # ----------------------------------------------------
         # SWITCH ACTIVE PROFILE
         # ----------------------------------------------------
         elif pressed_key == "*":
@@ -970,6 +1089,7 @@ while True:
             # note-off (or firing a phantom note-on) for a button
             # that's still physically held down across the switch.
             previous_volume = active_profile["volume"]
+            last_degree_index = None
 
             print("Switched active profile to profile" + str(active_index + 1))
 
