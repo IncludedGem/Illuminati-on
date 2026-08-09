@@ -2,8 +2,8 @@
 LOOP STATION -- HAcK 2026, Team 13
 ==================================
 
-A single-track looper with overdub and undo, sitting between the effects
-stage and the master volume in main.py's signal chain:
+A single-track looper with overdub, sitting between the effects stage
+and the master volume in main.py's signal chain:
 
     voices -> mix -> lowpass -> [LOOP TAP] -> master volume -> clip -> I2S
 
@@ -16,34 +16,44 @@ Two consequences of tapping there, both deliberate:
     scores live volume from silence to full, and a loop that ignored the
     knob would undercut that.
 
-UNDO MODEL  (read this before changing it)
-------------------------------------------
+OVERDUB MODEL  (read this before changing it)
+---------------------------------------------
 Two buffers: BASE holds the first take, LAYER holds overdubs.
 
-Every overdub pass accumulates into the SAME layer, so undo mutes all
-overdubs at once and returns you to the original take. Redo brings them
-back. Starting a fresh overdub while undone discards the muted layer.
-
-The alternative -- one undoable layer per pass, like a hardware RC-505
--- needs the previous layer merged into base every time you start a new
-pass. That merge is a loop over 44,000 samples inside the keypad
+Every overdub pass accumulates into the SAME layer. There is deliberately
+no undo -- a per-pass undo stack, like a hardware RC-505, needs the
+previous layer merged into base every time you start a new pass, and that
+merge is a loop over tens of thousands of samples inside the keypad
 handler: roughly 50-100 ms of stall, which is an audible dropout on
-stage. This design has no merge step at all.
+stage. This design has no merge step at all. Scrap a bad take with the
+reset key instead.
+
+layer_mark is what remains of that machinery, and it earns its keep on
+its own: an unmarked block is simply not read back, so the layer never
+has to be memset. First pass over a block overwrites, later passes
+accumulate.
 
 MEMORY
 ------
-Mono int16 at 11025 Hz costs 22,050 bytes per second, and there are TWO
+Mono int16 at 16000 Hz costs 32,000 bytes per second, and there are TWO
 buffers:
 
-    3 s -> 129 KB      4 s -> 172 KB      6 s -> 258 KB
+    2 s -> 125 KB      3 s -> 188 KB      4 s -> 250 KB
 
-The Pico 2 has 520 KB SRAM but MicroPython's heap is smaller than that.
-Run gc.mem_free() on YOUR board before raising `seconds`. A failure
-raises MemoryError at construction -- loud and early, not mid-set.
+Allocation needs 3x that figure momentarily unless _alloc_pair's
+drop-the-temporary path is preserved -- see the comment there before
+changing it.
 
-Length is quantised to whole audio blocks (~23 ms). That lets playback
-do its wrap check once per block instead of once per sample, and 23 ms
-is well below what reads as a timing error.
+The Pico 2 has 520 KB SRAM but MicroPython's heap is smaller than that,
+and pasting main.py into the REPL instead of running it from flash eats
+a large chunk of it. Run gc.mem_free() on YOUR board before raising
+`seconds`; the constructor backs off in half-second steps and the
+startup banner prints what it actually got.
+
+Length is quantised to whole audio blocks (16 ms at 256 samples /
+16000 Hz). That lets playback do its wrap check once per block instead
+of once per sample, and 16 ms is well below what reads as a timing
+error.
 
 STATE MACHINE
 -------------
@@ -85,7 +95,7 @@ def largest_block():
 
     gc.mem_free() is the TOTAL free bytes, which says nothing about
     whether any of it is contiguous. A heap with 400 KB free in 20 KB
-    scraps cannot allocate an 88 KB buffer. Binary-searches for the real
+    scraps cannot allocate a 128 KB buffer. Binary-searches for the real
     ceiling -- call it before constructing a Looper if allocation is
     misbehaving."""
     gc.collect()
@@ -110,13 +120,18 @@ def _alloc_pair(n_samples):
     it memcpy's the raw bytes, giving n int16 elements rather than
     iterating 2n byte values.
 
-    Both arrays are built from ONE temporary bytearray, which is then
-    dropped explicitly. Allocating them separately needs that temporary
-    twice, and the peak is what fails -- a 2n-byte scratch block has to
-    coexist with the 2n-byte array being built from it.
+    PEAK MATTERS MORE THAN TOTAL. The scratch bytearray must be alive
+    while an array is being copied out of it, so building BOTH arrays
+    from one live temporary peaks at 3x the buffer size -- 384 KB for a
+    4 s loop, which does not fit and silently costs you a second of loop
+    length via the constructor's back-off. Instead: build base from the
+    temporary, DROP the temporary, then build layer from base. An array
+    supports the buffer protocol just like a bytearray, so
+    array('h', base) is the same memcpy fast path and yields n elements,
+    not 2n. Peak is 2x, and a 4 s loop fits.
 
     Do NOT go back to growing these with extend(). Each extend allocates
-    a whole new buffer and abandons the old one, so building 88 KB
+    a whole new buffer and abandons the old one, so building 128 KB
     churns megabytes of short-lived blocks through the heap and leaves it
     too fragmented to hand out anything large.
     """
@@ -124,16 +139,20 @@ def _alloc_pair(n_samples):
 
     raw = bytearray(2 * n_samples)
     base = array("h", raw)
-    layer = array("h", raw)
 
+    # Dropped BEFORE layer is allocated -- this line is the whole point
+    # of the function; see PEAK MATTERS above.
     raw = None
+    gc.collect()
+
+    layer = array("h", base)
     gc.collect()
 
     # If a firmware build ever iterates instead of memcpy'ing, this
     # returns 2n elements of byte values and every loop would play back
     # as noise. Fail loudly at boot instead.
     if len(base) != n_samples or len(layer) != n_samples:
-        raise RuntimeError("array('h', bytearray) did not copy raw bytes")
+        raise RuntimeError("array('h', buffer) did not copy raw bytes")
 
     return base, layer
 
@@ -142,7 +161,7 @@ class Looper:
 
     __slots__ = (
         "block", "capacity", "n_blocks", "seconds",
-        "base", "layer", "layer_mark", "layer_on",
+        "base", "layer", "layer_mark",
         "state", "pos", "length",
     )
 
@@ -185,9 +204,8 @@ class Looper:
 
         # Which blocks the overdub layer has actually written. This is
         # how the layer gets "zeroed" for free: an unmarked block is
-        # simply not read back, so we never memset 88 KB anywhere.
+        # simply not read back, so we never memset 128 KB anywhere.
         self.layer_mark = bytearray(self.n_blocks)
-        self.layer_on = True
 
         self.state = STOPPED
         self.pos = 0       # sample index, always a multiple of block
@@ -216,26 +234,16 @@ class Looper:
 
         elif s == STOPPED:
             # Paused with content: record means overdub, so start moving.
-            self._begin_overdub()
+            self.state = OVERDUB
 
         elif s == PLAYING:
-            self._begin_overdub()
+            self.state = OVERDUB
 
         elif s == OVERDUB:
             self.state = PLAYING
 
-    def _begin_overdub(self):
-        # If the layer is currently undone, the user has chosen to
-        # discard it -- clearing the marks throws it away without
-        # touching the 88 KB of samples behind them.
-        if not self.layer_on:
-            for i in range(self.n_blocks):
-                self.layer_mark[i] = 0
-            self.layer_on = True
-        self.state = OVERDUB
-
     def play_toggle(self):
-        """Play/pause key (numpad 6). No effect on an empty looper.
+        """Play/pause key (numpad 4). No effect on an empty looper.
         Pausing from overdub drops to paused, not to recording."""
         if self.length == 0:
             return
@@ -245,37 +253,24 @@ class Looper:
         else:
             self.state = STOPPED
 
-    def undo_toggle(self):
-        """Undo/redo key (numpad 3). Mutes or restores every overdub,
-        returning to (or from) the original take. No effect when nothing
-        has been overdubbed."""
-        if not self.has_layer():
-            return
-        self.layer_on = not self.layer_on
-
     def reset(self):
-        """Reset key (numpad 2). Wipe everything.
+        """Reset key (numpad 1). Wipe everything -- this is the only way
+        to scrap a take now that undo is gone.
 
         The sample buffers are deliberately left alone: length = 0 means
-        nothing can be read, and the next take overwrites from 0. Zeroing
-        88 KB here would stall the audio loop for tens of milliseconds."""
+        nothing can be read, and clearing layer_mark means no overdub
+        block is read back either, so the next take overwrites from 0.
+        Zeroing 128 KB here would stall the audio loop for tens of
+        milliseconds."""
         self.state = STOPPED
         self.pos = 0
         self.length = 0
-        self.layer_on = True
         for i in range(self.n_blocks):
             self.layer_mark[i] = 0
 
     # ------------------------------------------------------------
     # Status
     # ------------------------------------------------------------
-
-    def has_layer(self):
-        """True once any overdub has been written."""
-        for i in range(self.n_blocks):
-            if self.layer_mark[i]:
-                return True
-        return False
 
     def state_name(self):
         """Short lowercase name for the website JSON."""
@@ -289,23 +284,16 @@ class Looper:
         return "pause" if self.length else "empty"
 
     def status_text(self):
-        """Line for the OLED. The trailing U marks an undone layer, so
-        it is obvious on stage why the overdub went quiet."""
+        """Line for the OLED. Kept to 8 characters or fewer -- the row
+        reads "Loop: <this>" and the screen is 16 characters wide."""
         s = self.state
         if s == RECORDING:
-            t = "REC"
-        elif s == PLAYING:
-            t = "PLAY"
-        elif s == OVERDUB:
-            t = "DUB"
-        elif self.length:
-            t = "PAUSE"
-        else:
-            t = "EMPTY"
-
-        if self.length and not self.layer_on:
-            t += " U"
-        return t
+            return "REC"
+        if s == PLAYING:
+            return "PLAY"
+        if s == OVERDUB:
+            return "DUB"
+        return "PAUSE" if self.length else "EMPTY"
 
     def is_sounding(self):
         """True when the looper is putting audio into the mix. main.py's
@@ -330,7 +318,7 @@ class Looper:
     def update_bar(self, display):
         """Draw the bar and push ONLY the bottom page: 128 bytes instead
         of the 1024 a full show() sends. A full frame at 400 kHz takes
-        ~25 ms, which exceeds one audio block's entire 23 ms budget --
+        ~25 ms, which exceeds one audio block's entire 16 ms budget --
         fine occasionally, ruinous at the 20 fps a smooth bar wants.
         This is ~3 ms, so it can run every block if you like.
 
@@ -407,7 +395,7 @@ class Looper:
         # once per block instead of once per sample.
         layer = self.layer
         bi = pos // self.block
-        marked = self.layer_mark[bi] and self.layer_on
+        marked = self.layer_mark[bi]
 
         if state == PLAYING:
             if marked:
@@ -422,7 +410,7 @@ class Looper:
                     i += 1
 
         else:   # OVERDUB
-            if self.layer_mark[bi]:
+            if marked:
                 # Already written on an earlier pass: accumulate.
                 i = 0
                 while i < n:

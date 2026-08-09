@@ -11,7 +11,7 @@ FILE LAYOUT
                   after the Looper (see the import site in this file
                   and the warning at the top of instruments.py)
   display.py      OLED partial-redraw driver
-  loop.py          overdubbing looper (pre-existing, not touched here)
+  loop.py         overdubbing looper (record / overdub / reset)
 
 SIGNAL CHAIN
 ------------
@@ -34,6 +34,9 @@ KEYPAD
     7  sample -         8  octave -         9  key -
     *  sample +         0  octave +         #  key +
 
+Key 2 is free. It used to be reserved for loop undo/redo; that feature
+was scrapped, so reset (key 1) is now the only way to scrap a take.
+
 
 MODES
 -----
@@ -48,8 +51,8 @@ audio.write() blocks until the I2S peripheral has room, so the main loop
 runs once per audio block. Press-to-sound latency is the sum of two
 things, and the second is the one that bites:
 
-  1. button poll interval   = BUF_SAMPLES / SAMPLE_RATE        = 23 ms
-  2. audio already queued   = IBUF_BLOCKS * BUF_SAMPLES / RATE = 70 ms
+  1. button poll interval   = BUF_SAMPLES / SAMPLE_RATE        = 16 ms
+  2. audio already queued   = IBUF_BLOCKS * BUF_SAMPLES / RATE = 48 ms
 
 In steady state the I2S buffer stays FULL -- the writer runs ahead until
 write() blocks -- so every sample waits behind a full ibuf before it
@@ -57,7 +60,7 @@ reaches the DAC. Making the synth compute faster does not change this.
 Only shrinking the queue does.
 
 The tradeoff: a smaller ibuf means less slack, so any single loop pass
-that overruns 23 ms produces an audible click. A full OLED frame is the
+that overruns 16 ms produces an audible click. A full OLED frame is the
 biggest spike (~25 ms), which is why the full redraw is rate-limited and
 the loop progress bar pushes only its own 128-byte page. Set
 TIMING = True and read the worst-case numbers before going tighter.
@@ -86,6 +89,7 @@ this feed for the first time should treat its absence as "Major".
 """
 
 import gc
+import os
 import time
 import json
 import math
@@ -215,37 +219,156 @@ def _load_wav_samples(path):
     that adds metadata chunks.
 
     Raises loudly at boot (not mid-performance) if a file is missing or
-    malformed -- fail early rather than play garbage or silence on stage."""
+    malformed -- fail early rather than play garbage or silence on stage.
+    The fmt chunk IS checked: render_drum_voice copies samples straight
+    into the mix with no rate conversion and no channel handling, so a
+    44.1 kHz or stereo file does not error, it just plays at the wrong
+    pitch and half speed. That is a miserable thing to debug on stage
+    and cheap to catch here."""
     with open(path, "rb") as f:
         header = f.read(12)
         if header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
             raise RuntimeError(path + ": not a RIFF/WAVE file")
 
-        # Walk chunks until 'data' is found.
+        raw = None
+        fmt_seen = False
+
+        # Walk chunks until 'data' is found. RIFF chunks are word
+        # aligned: an odd-sized chunk is followed by one pad byte that
+        # is NOT counted in chunk_size. Skipping only chunk_size bytes
+        # leaves the reader one byte out of step and every subsequent
+        # chunk id reads as garbage.
         while True:
             chunk_id = f.read(4)
             if len(chunk_id) < 4:
                 raise RuntimeError(path + ": no data chunk found")
-            chunk_size = int.from_bytes(f.read(4), "little")
-            if chunk_id == b"data":
-                raw = f.read(chunk_size)
-                break
-            f.read(chunk_size)   # skip this chunk (e.g. 'fmt ')
+            size_bytes = f.read(4)
+            if len(size_bytes) < 4:
+                raise RuntimeError(path + ": truncated chunk header")
+            chunk_size = int.from_bytes(size_bytes, "little")
+            pad = chunk_size & 1
 
-    samples = array("h", raw)
-    if len(samples) * 2 != len(raw):
-        raise RuntimeError(path + ": data chunk size not a multiple of 2 bytes")
-    return samples
+            if chunk_id == b"fmt ":
+                fmt = f.read(chunk_size)
+                audio_format = int.from_bytes(fmt[0:2], "little")
+                channels = int.from_bytes(fmt[2:4], "little")
+                rate = int.from_bytes(fmt[4:8], "little")
+                bits = int.from_bytes(fmt[14:16], "little")
+                if audio_format != 1 or bits != 16 or channels != 1:
+                    raise RuntimeError(
+                        path + ": need 16-bit mono PCM, got format "
+                        + str(audio_format) + "/" + str(bits) + "-bit/"
+                        + str(channels) + "ch")
+                if rate != SAMPLE_RATE:
+                    raise RuntimeError(
+                        path + ": sample rate " + str(rate) + " != "
+                        + str(SAMPLE_RATE) + " (no resampling on the Pico)")
+                fmt_seen = True
+                if pad:
+                    f.read(1)
+
+            elif chunk_id == b"data":
+                if chunk_size & 1:
+                    raise RuntimeError(
+                        path + ": data chunk size not a multiple of 2 bytes")
+                raw = f.read(chunk_size)
+                if len(raw) != chunk_size:
+                    raise RuntimeError(
+                        path + ": data chunk truncated (" + str(len(raw))
+                        + " of " + str(chunk_size) + " bytes)")
+                break
+
+            else:
+                f.read(chunk_size + pad)   # metadata etc., skip it
+
+    if not fmt_seen:
+        raise RuntimeError(path + ": no fmt chunk before data")
+
+    return array("h", raw)
 
 
 # Where the .wav files live on the Pico's flash filesystem. Loaded AFTER
 # the Looper (see AUDIO CONSTANTS + LOOPER at the top) for the same
 # reason WAVETABLES is: the Looper's big allocation needs the heap still
 # clean, so smaller allocations happen once that's safely done.
-DRUM_KIT_DIR = "drums/"
+#
+# ABSOLUTE path, leading slash, deliberately. A relative "drums/"
+# resolves against the current working directory, which is not the same
+# thing depending on how this file got run (pasted into the REPL,
+# `mpremote run`, or auto-started from flash). "/drums/" is the same
+# directory in all three cases.
+DRUM_KIT_DIR = "/"
 
-DRUM_SAMPLES = tuple(_load_wav_samples(DRUM_KIT_DIR + fname)
-                      for fname in DRUM_FILES)
+# LOADED BIGGEST FIRST, then reordered back into button order.
+#
+# Loading a wav costs 2x its size for a moment -- f.read() hands back the
+# raw bytes and array("h", raw) copies them into a second block of the
+# same size -- and only 1x once the bytes are dropped. So the whole bank
+# fits iff  total + largest <= free, and the ORDER decides whether that
+# peak lands on an empty heap or one that seven samples have already
+# carved up. Ascending order fails on the last (largest) file with plenty
+# of total room left; descending order takes the big hit first and then
+# only needs small ones. Same resident memory either way, strictly better
+# odds of getting there.
+#
+# Sizes are read first so the whole set can be checked BEFORE anything is
+# allocated -- an up-front number you can act on beats a MemoryError
+# seven files deep.
+
+_sizes = []
+for _i in range(len(DRUM_FILES)):
+    _path = DRUM_KIT_DIR + DRUM_FILES[_i]
+    try:
+        _sizes.append((os.stat(_path)[6], _i))
+    except OSError as e:
+        raise OSError("cannot open " + _path + " (errno " + str(e.args[0])
+                      + ") -- is " + DRUM_KIT_DIR
+                      + " a directory with all 8 wavs in it?")
+
+_sizes.sort()
+_sizes.reverse()                      # biggest first
+
+gc.collect()
+_need = 0
+for _sz, _i in _sizes:
+    _need += _sz
+_need += _sizes[0][0]                 # the transient peak on the largest
+_free = gc.mem_free()
+
+if _need > _free:
+    # Every 0.5 s of LOOP_SECONDS is 0.5 * SAMPLE_RATE * 2 bytes * 2
+    # buffers = 32000 bytes, so the shortfall converts straight into the
+    # number of half-seconds of loop that have to go back.
+    _short = _need - _free
+    raise MemoryError(
+        "drum bank needs ~" + str(_need) + " bytes (" + str(_need - _sizes[0][0])
+        + " resident + " + str(_sizes[0][0]) + " peak on "
+        + DRUM_FILES[_sizes[0][1]] + "), only " + str(_free)
+        + " free -- short by " + str(_short) + ". Trim the longest samples, or"
+        + " drop LOOP_SECONDS by " + str((_short + 31999) // 32000 * 0.5) + " s")
+
+_slots = [None] * len(DRUM_FILES)
+for _sz, _i in _sizes:
+    _path = DRUM_KIT_DIR + DRUM_FILES[_i]
+    try:
+        _slots[_i] = _load_wav_samples(_path)
+    except OSError as e:
+        raise OSError("cannot open " + _path + " (errno " + str(e.args[0])
+                      + ") -- is " + DRUM_KIT_DIR
+                      + " a directory with all 8 wavs in it?")
+    except MemoryError:
+        # Preflight said it fits, so getting here means fragmentation,
+        # not arithmetic: the bytes are free but not in one run.
+        raise MemoryError(
+            "no contiguous run for " + _path + " (" + str(_sz) + " bytes, "
+            + "needs " + str(2 * _sz) + " to load) -- free=" + str(gc.mem_free())
+            + "; heap is fragmented, lower LOOP_SECONDS")
+
+DRUM_SAMPLES = tuple(_slots)          # back in button order: 0=Kick .. 7=Crash
+_sizes = None
+_slots = None
+_path = None
+gc.collect()
 
 
 class DrumVoice:
@@ -792,12 +915,30 @@ while True:
                     voices[i].note_on(freq, preset["sample"])
                     last_degree_index = i
             elif prev_key_bits[i] and not key_bits[i]:
-                if is_drums:
-                    drum_voices[i].note_off()   # no-op; see DrumVoice
-                else:
-                    voices[i].note_off()
+                # NOT dispatched on is_drums, unlike note-on. is_drums
+                # reflects the sample selected RIGHT NOW, but the voice
+                # that needs releasing was started under whatever the
+                # sample was when the button went down. Hold a note on
+                # Strings, press '*' to cycle to Drums, release: the
+                # drums branch would fire, DrumVoice.note_off() is a
+                # no-op, and voices[i] is stranded in SUSTAIN and drones
+                # forever. Preset switching (key '3') can cross the same
+                # boundary. Releasing BOTH is unconditionally safe -- a
+                # drum one-shot ignores note_off by design and an idle
+                # Voice.note_off() is a no-op too -- so there is no
+                # reason to branch here at all.
+                voices[i].note_off()
+                drum_voices[i].note_off()
 
-        state["keys"] = [b == 1 for b in key_bits]
+        # Mutated in place: a list comprehension here would allocate a
+        # fresh 8-element list on every button edge, which is exactly
+        # what key_bits being a bytearray is meant to avoid. `state` is
+        # only read by json.dumps() and the OLED, both of which see the
+        # same list object updated.
+        state_keys = state["keys"]
+        for i in range(NUM_VOICES):
+            state_keys[i] = key_bits[i] == 1
+
         prev_key_bits[:] = key_bits
         changed = True
 
