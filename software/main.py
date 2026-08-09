@@ -4,14 +4,32 @@ PICO 2 W MUSIC CONTROLLER -- HAcK 2026, Team 13
 
 FILE LAYOUT
 -----------
-  main.py        this file: hardware setup, voices, filter, main loop
+  main.py        this file: hardware setup, voices, filter, main loop,
+                  AND the tone data -- see INSTRUMENTS below
   keypad.py       3x4 matrix scan + debounce (no dependency on anything)
   scale.py        key/octave/mode theory, pure functions
-  instruments.py  wavetables + instrument table -- MUST be imported
-                  after the Looper (see the import site in this file
-                  and the warning at the top of instruments.py)
   display.py      OLED partial-redraw driver
   loop.py         overdubbing looper (record / overdub / reset)
+
+There is deliberately no instruments.py. The tone data lives inline,
+after the Looper is constructed, because the Looper's big contiguous
+buffers must land on a still-clean heap -- an import would run at the
+top of the file, i.e. before that.
+
+NO DRUM KIT. The sample-playback drum voices, the .wav loader and the
+eight one-shot samples have been removed and are not coming back in this
+file. They were the project's second-largest allocation and needed ~26 KB
+in a single contiguous run, which is what turned every heap hiccup into
+a boot failure. With them gone the Looper is the only large allocation
+left. If drums return, they need their own rate-matched kit -- the loader
+required 12000 Hz mono 16-bit and the old kit was 16000 Hz.
+
+RUN THIS FROM FLASH, NOT BY PASTING IT INTO THE REPL. A paste is held
+and recopied as a growing buffer while it streams in, then parsed, all
+before line one executes, which leaves the heap in scraps. Less fatal
+now that nothing needs a 26 KB run, but the Looper still wants two clean
+ones and will quietly hand you a shorter loop than you asked for if it
+cannot get them. The banner prints what it actually got.
 
 SIGNAL CHAIN
 ------------
@@ -31,46 +49,87 @@ KEYPAD
 ------
     1  loop reset       2  (unmapped)       3  cycle preset
     4  play / pause     5  loop record      6  cycle mode
-    7  sample -         8  octave -         9  key -
-    *  sample +         0  octave +         #  key +
+    7  instrument -     8  octave -         9  key -
+    *  instrument +     0  octave +         #  key +
 
-Key 2 is free. It used to be reserved for loop undo/redo; that feature
-was scrapped, so reset (key 1) is now the only way to scrap a take.
+Key 2 is free. It used to be loop undo/redo; that feature was scrapped,
+so reset (key 1) is the only way to scrap a take.
 
 WHERE THE SOUND LIVES  (read this before "replacing the synth")
 ---------------------------------------------------------------
 This file contains the ENGINE -- phase accumulation, envelope stepping,
-interpolation, mixing. It contains no tone decisions at all. Every
-spectrum and every ADSR setting lives in instruments.py, which now
-carries the standalone synth's recipes verbatim.
+interpolation, mixing -- and the TONE DATA it reads: WAVETABLES and
+ENVELOPES, in the INSTRUMENTS block.
 
-That split matters because the two are independently swappable, and only
-one of them was ever the problem. The engine here is the integer form of
-the same algorithm the standalone ran in floats: same wavetable lookup,
-same ADSR shape, plus linear interpolation. It is strictly cheaper per
-sample and does not allocate. What made this build sound thin next to the
-standalone was the OLD instruments.py band-limiting every table down to
-two harmonics -- a tone problem, fixed in the tone file.
+The engine is the INTEGER form of the algorithm the standalone prototype
+ran in floats: same wavetable-lookup shape, same ADSR shape, plus linear
+interpolation. It is strictly cheaper per sample and does not allocate.
+The tone data is the standalone's, unchanged in substance -- the same
+harmonic recipes and the same ADSR numbers -- with one addition, peak
+normalization, documented at make_table().
+
+Two things from the standalone were deliberately NOT carried over:
+
+  the float engine   MicroPython boxes every float on the heap, so the
+                     inner loop (256 iterations per voice per block,
+                     2048 with 8 voices) allocated constantly. That is
+                     what made CPU load track voice count, and voice
+                     count is the axis the garbling moved along. See
+                     the fixed-point block in SYNTH VOICES.
+
+  NOTE_FREQS /       one fixed note per button, one global instrument.
+  INSTRUMENT         Superseded: pitch comes from build_scale_freqs()
+                     via the preset's key/octave/mode, and the
+                     instrument is per-preset and cycled from the
+                     keypad.
+
+The engine does not care how many entries either dict has -- only that
+every value preset["sample"] can hold resolves to one, and that
+DEFAULT_SAMPLE always exists as a fallback (see the .get() calls in
+Voice.note_on).
 
 Three things gate the sound before it reaches the DAC, in order. Check
-them in this order if it still sounds wrong:
+them in this order if it sounds wrong:
 
   1. the cutoff knob (GP27). The lowpass sits in front of everything, so
      a low cutoff muffles the whole instrument no matter how rich the
-     table is. read_pot() now reports FULLY OPEN until that pot has been
-     swept far enough to calibrate, so an unwired or untouched GP27 can
-     no longer silently filter the set -- see POTS.
+     table is. read_pot() reports FULLY OPEN until that pot has been
+     swept far enough to calibrate, so an unwired or untouched GP27
+     cannot silently filter the set -- see POTS.
   2. MIX_HEADROOM. The standalone was loud partly because it clipped on
      any two-note chord; this divides down first so chords stay clean.
-     See the constant for the exact clip math.
   3. the volume knob (GP26), square-law, so it feels linear.
+
+INSTRUMENTS
+-----------
+Eleven tuned wavetables -- Sawtooth, Organ, Bell, Pluck, Piano, Guitar,
+Bass, Flute, Clarinet, Trumpet, Strings -- cycled with '*' and '7'.
+
+Two consequences of a real tone set worth knowing before the demo:
+
+  ALIASING. Nyquist is 6000 Hz at this sample rate, and a wavetable's
+  harmonics scale with the note, so harmonic n of a note at f lands at
+  n*f whether or not that fits. The bright tables (Trumpet, Sawtooth,
+  Organ, Pluck) carry content out to the 10th harmonic, which folds back
+  as a metallic grit above roughly octave 5. This is inherent to
+  single-table synthesis and is not a bug to hunt; the standalone had it
+  worse at 11025 Hz. Keep bright patches in octaves 3-5, use the mellow
+  ones (Flute, Bass, Clarinet, Piano) up high, or roll the cutoff knob
+  down -- the filter sits before everything precisely so it can.
+
+  LONGER TAILS. Bell releases over 1.9 s, Guitar 0.8 s, Strings 0.55 s.
+  A voice in release is still rendering, so held-and-released passages
+  keep more voices active than a short patch does, and those tails sum
+  on top of whatever is being played now. If a busy passage distorts,
+  that is MIX_HEADROOM, not an overrun -- raise it to 3.0 or back the
+  volume knob off.
 
 MODES
 -----
-Nine scales are available per preset: Major, Natural Minor, Melodic
-Minor, Harmonic Minor, Dorian, Phrygian, Lydian, Mixolydian, Locrian.
-Melodic Minor is direction-sensitive (its 6th and 7th degrees differ
-ascending vs. descending) -- see MELODIC MINOR below.
+Nine scales per preset: Major, Natural Minor, Melodic Minor, Harmonic
+Minor, Dorian, Phrygian, Lydian, Mixolydian, Locrian. Melodic Minor is
+direction-sensitive (its 6th and 7th degrees differ ascending vs.
+descending) -- see MELODIC MINOR below.
 
 LATENCY BUDGET  (read before touching BUF_SAMPLES or IBUF_BLOCKS)
 -----------------------------------------------------------------
@@ -86,45 +145,31 @@ write() blocks -- so every sample waits behind a full ibuf before it
 reaches the DAC. Making the synth compute faster does not change this.
 Only shrinking the queue does.
 
-The tradeoff: a smaller ibuf means less slack, so any single loop pass
-that overruns 16 ms produces an audible click. See SPIKE BUDGET.
-
-The standalone synth's settings (11025 Hz, BUF_SAMPLES 1024, ibuf 8192)
-are NOT portable here, and this is the reason: 1024/11025 is a 93 ms
-block and 8192 bytes is four more of them, so press-to-sound would be
-about 460 ms. That is fine for a script that only plays notes and
-unplayable for an instrument you perform on. It also breaks two things
-outright -- the drum .wav files are 12000 Hz and _load_wav_samples()
-raises at boot on any mismatch, and LOOP_SECONDS is budgeted against
-this rate. Keep the tone, not the timing.
+The standalone's settings (11025 Hz, BUF_SAMPLES 1024, ibuf 8192) are
+NOT portable here: 1024/11025 is a 93 ms block and 8192 bytes is four
+more of them, so press-to-sound would be about 460 ms. Fine for a script
+that only plays notes, unplayable for an instrument you perform on.
+LOOP_SECONDS is also budgeted against this rate. Keep the tone, not the
+timing.
 
 SPIKE BUDGET  (why chords used to cut out)
 ------------------------------------------
 Render cost scales with BUF_SAMPLES and so does the budget (BUF_SAMPLES /
-SAMPLE_RATE), so their ratio is fixed and a BIGGER BUFFER CANNOT FIX AN
+SAMPLE_RATE), so their ratio is fixed and A BIGGER BUFFER CANNOT FIX AN
 OVERRUN CAUSED BY RENDERING. That it did help was the diagnosis: the
 overruns were FIXED per-pass costs, which do not scale with the buffer
-and so shrink as a fraction of a longer block. Rather than pay latency to
-hide them, each is now capped at source:
+and so shrink as a fraction of a longer block. Each is capped at source:
 
   serial   json.dumps + print allocates ~200 bytes and writes to USB
            CDC, which BLOCKS if the host has the port open but is not
-           draining it -- tens of milliseconds, entirely outside our
-           control. A chord lands 2-3 button edges in consecutive
-           blocks and each one used to print. Now coalesced to one line
-           per JSON_MIN_INTERVAL_MS.
+           draining it. Coalesced to one line per JSON_MIN_INTERVAL_MS.
+  OLED     a preset cycle dirties all 5 text rows: ~15 ms of I2C.
+           display.py queues pages and drains ONE (~3 ms) per pass, and
+           a pass that already pushed the progress bar drains none.
+  GC       skipped on any pass that already did serial or OLED work.
 
-  OLED     a preset cycle changes key, octave, sample and mode at once,
-           dirtying all 5 text rows: ~15 ms of I2C against a 16 ms
-           budget. display.py now queues pages and drains ONE (~3 ms)
-           per pass, and a pass that already pushed the loop progress
-           bar drains none.
-
-  GC       skipped on any pass that already did serial or OLED work, so
-           a collection cannot land on top of another spike.
-
-Worst case per pass is therefore one page of I2C plus at most one JSON
-line, never both plus a collection.
+Worst case per pass is one page of I2C plus at most one JSON line, never
+both plus a collection.
 
 MELODIC MINOR
 -------------
@@ -134,28 +179,27 @@ button's index to the PREVIOUS note's button index (higher = ascending).
 `last_degree_index` remembers that previous index and resets to None
 ("no direction yet, assume ascending") on any edit that changes what a
 button index means -- key, octave, mode, or preset switch -- so a
-melodic line's direction can't leak across an edit that changed the
+melodic line's direction cannot leak across an edit that changed the
 scale underneath it.
 
 SERIAL PROTOCOL
 ---------------
 State changes print one line: '#' + JSON, coalesced to at most one line
-per JSON_MIN_INTERVAL_MS (30 ms) -- quicker than a 30 fps video frame, so
-the visualiser cannot perceive the difference, while a fast chord can no
-longer queue three blocking USB writes into three consecutive audio
+per JSON_MIN_INTERVAL_MS (30 ms) -- quicker than a 30 fps video frame,
+so the visualiser cannot perceive the difference, while a fast chord can
+no longer queue three blocking USB writes into three consecutive audio
 blocks. While the looper runs a heartbeat goes out every
-JSON_LOOP_INTERVAL_MS (100 ms) so the website can animate loop position;
-that stays slower deliberately, since it fires continuously and change
-lines do not. The website reads only lines starting with '#'; anything
-else is human debug output. DEBUG = False silences it.
+JSON_LOOP_INTERVAL_MS (100 ms) so the website can animate loop position.
+The website reads only lines starting with '#'; anything else is human
+debug output. DEBUG = False silences it.
 
-JSON fields: preset, octave, key, sample, mode, volume, cutoff, keys[8],
-loop, loop_pos. `mode` is new as of this revision -- a visualizer reading
-this feed for the first time should treat its absence as "Major".
+Fields: preset, octave, key, sample, mode, volume, cutoff, keys[8],
+loop, loop_pos. `sample` is now one of the eleven instrument names --
+never "Drums" and never the "--" placeholder the controller-only build
+sent, so a visualiser that special-cased either can drop that branch.
 """
 
 import gc
-import os
 import time
 import json
 import math
@@ -173,11 +217,15 @@ DEBUG = False     # per-keypress serial chatter
 # AUDIO CONSTANTS + LOOPER   (allocated FIRST, deliberately)
 # ============================================================
 # The loop buffers are the largest allocation in the project and must be
-# contiguous. gc.mem_free() reporting plenty free means nothing if it's
+# contiguous. gc.mem_free() reporting plenty free means nothing if it is
 # fragmented into scraps -- so the Looper is constructed while the heap
-# is still one clean block, before wavetables/OLED/I2S/cutoff-table
+# is still one clean block, before wavetables / OLED / I2S / cutoff-table
 # allocations carve it up. Everything below is small and fits in
 # whatever heap is left.
+#
+# It used to compete with a ~150 KB drum bank for that heap. With the
+# drums gone it is the only large allocation, which is why this build
+# has room the previous ones did not.
 
 SAMPLE_RATE = 12000
 BUF_SAMPLES = const(256)
@@ -198,48 +246,404 @@ BUF_SAMPLES = const(256)
 # plays back cleaner, the samples were always fine and the DAC was being
 # starved. That is an underrun, not a synthesis problem.
 #
-# Nyquist here is 6000 Hz. See N_MAX in instruments.py for why the
-# wavetables are NO LONGER band-limited to suit it, and CUTOFF_MAX_HZ
-# below.
+# The drum kit used to pin this rate hard (its wavs were rendered at
+# 12000 and the loader refused anything else). That constraint is gone,
+# but the budget argument above is not, and CUTOFF_MAX_HZ still tracks
+# this number.
 
 # Size the I2S buffer for double/triple buffering, NOT a big safety
 # margin -- every extra block of ibuf is another block of latency between
-# a keypress and the sound.
-#
-# LEFT AT 3 DELIBERATELY. Raising it to 4 was on the table while the rate
-# was still 16000, but a longer block period multiplies through here too:
-# total latency is (1 + IBUF_BLOCKS) * BUF_SAMPLES / SAMPLE_RATE, so at
-# 12000 Hz
+# a keypress and the sound. Total latency is
+# (1 + IBUF_BLOCKS) * BUF_SAMPLES / SAMPLE_RATE, so at 12000 Hz:
 #
 #     IBUF 2 -> 64 ms      IBUF 3 -> 85 ms      IBUF 4 -> 107 ms
 #
-# and 4 would be audibly laggy to play. 3 gives 85 ms with a 21.3 ms
-# budget that the fixed-point voice render now fits inside several times
-# over. If clicks somehow persist, go to 4 before touching anything else
-# -- a laggy instrument still scores, one that cuts out does not. If it
-# is rock solid, 2 buys back the latency.
-IBUF_BLOCKS = 3
+# RAISED TO 4 FOR CLEANLINESS. 3 gives 85 ms of queue against a 21.3 ms
+# per-pass budget, and the render fits that budget several times over --
+# but the render was never what overran it. The OLED, the serial writes
+# and GC are fixed costs that do not shrink with a faster synth, and any
+# single pass that blows 21.3 ms starves the DAC and clicks. A fourth
+# block is one more pass of slack to absorb that.
+#
+# The standalone never clicks partly because it queues ~460 ms and does
+# nothing but render. This is the same trade at a fraction of the cost:
+# 107 ms is still playable, 460 ms is not. If it turns out rock solid,
+# 3 buys the latency back and 2 buys more.
+IBUF_BLOCKS = 4
 
-# Two int16 buffers (base take + overdub layer): 4 s costs 188 KB at this
-# rate (down from 250 KB at 16000 -- the rate drop pays for itself in
-# heap as well as CPU). The Looper backs off in half-second steps if that
-# won't fit, so a tight board gets a shorter loop rather than a traceback
-# -- the startup banner prints what it actually got.
+# Two int16 buffers (base take + overdub layer): 4 s costs 188 KB at
+# this rate. The Looper backs off in half-second steps if that will not
+# fit, so a tight board gets a shorter loop rather than a traceback --
+# the startup banner prints what it actually got.
 LOOP_SECONDS = 4
 
 looper = loop.Looper(SAMPLE_RATE, BUF_SAMPLES, seconds=LOOP_SECONDS)
 
-# MUST be imported here, after the Looper -- see the allocation-order
-# warning at the top of instruments.py. This builds 14 wavetables.
-from instruments import (TABLE_LEN, WAVETABLES, ENVELOPES, DRUM_KIT_NAME,
-                          shift_sample)
+
+def _largest_free_run():
+    """Biggest single allocation the heap can still serve, by binary
+    search on bytearray().
+
+    gc.mem_free() is a TOTAL and says nothing about shape. That
+    distinction is the whole story of this project's memory failures --
+    197 KB free, and not one 26 KB run in it. Kept now that the drum
+    bank is gone because the Looper still needs long runs, and because
+    a number in the banner beats guessing.
+
+    ~18 probe allocations, each freed and collected immediately. Called
+    once at boot, never in a hot path."""
+    gc.collect()
+    lo = 0
+    hi = gc.mem_free()
+    while lo < hi:
+        mid = (lo + hi + 1) >> 1
+        try:
+            _probe = bytearray(mid)
+        except MemoryError:
+            gc.collect()
+            hi = mid - 1
+        else:
+            _probe = None
+            gc.collect()
+            lo = mid
+    return lo
+
+
+# ============================================================
+# INSTRUMENTS  (wavetables + ADSR envelopes)
+# ============================================================
+# Built after the Looper and not one line before it: the loop buffers
+# need a clean heap, so every smaller allocation waits until they have
+# landed. Resident cost is 11 tables x 256 samples x 2 bytes = ~5.6 KB,
+# so trimming instruments is never the right answer to a MemoryError
+# here -- LOOP_SECONDS is the only lever with real bytes behind it.
+#
+# Boot cost is ~17k sin() calls in interpreted MicroPython, a second or
+# two of dead time before the banner prints. That is the price of
+# generating tables rather than shipping them, and it keeps the recipes
+# readable and editable in one place.
+#
+# TABLE_LEN is a local const, not imported from anywhere -- MicroPython's
+# const() only folds literals or other consts declared in THIS module,
+# which is what lets _PHASE_WRAP down in SYNTH VOICES fold to a
+# compile-time literal instead of costing a runtime shift every note-on.
+TABLE_LEN = const(256)
+TABLE_AMP = 32000   # int16 peak -- see "Peak is 32000 * 32768 >> 15" on
+                     # render_voice before changing this number.
+
+
+# ---------------- Shared sine table ----------------
+#
+# ONE table of sin() values, built once, and every partial of every
+# instrument is read out of it instead of calling math.sin again.
+#
+# This is what makes the band-limiting below affordable. The standalone
+# calls math.sin once per partial per sample, which is ~17k calls for
+# one table set; doing that for four octave bands would be ~70k calls
+# and six to twelve seconds of dead time at boot. Reading a 256-entry
+# table instead costs 256 sin() calls TOTAL and turns the rest into
+# integer indexing.
+#
+# Partial n at position i is sin(2*pi*n*i/TABLE_LEN), i.e. this table
+# read with a stride of n -- exact for integer n, and interpolated below
+# for the non-integer partials Bell and Piano use.
+_SINE = [math.sin(2.0 * math.pi * i / TABLE_LEN) for i in range(TABLE_LEN)]
+
+
+def _sine_at(x):
+    """sin(2*pi*x) for x in table-index units, linearly interpolated.
+
+    Integer strides hit table entries exactly and the interpolation is a
+    no-op. Bell's 2.71 and Piano's 5.08 do not, and rounding them to the
+    nearest entry would detune those partials by up to half a table step
+    -- audible as a slightly sour bell, which is the one instrument
+    whose whole character is its inharmonic partials."""
+    i = int(x) & (TABLE_LEN - 1)
+    frac = x - int(x)
+    if frac == 0.0:
+        return _SINE[i]
+    j = (i + 1) & (TABLE_LEN - 1)
+    return _SINE[i] + (_SINE[j] - _SINE[i]) * frac
+
+
+# ---------------- Instruments as PARTIALS, not functions ----------------
+#
+# Each entry is a tuple of (harmonic_number, amplitude). Same recipes and
+# same numbers as the standalone -- but as DATA rather than baked into a
+# function body, which is the whole point: a function can only be sampled
+# as-is, whereas a partial list can be truncated, and truncating it is
+# the only real cure for aliasing (see BANDS below).
+#
+# The standalone's /3.48-style divisors are gone. They normalized by the
+# sum of coefficients, which is not the true peak anyway, and every table
+# is peak-normalized after the fact now. Dropping them also means a
+# band-limited version does not have to carry its parent's divisor.
+#
+# Sawtooth is generated rather than listed: a ramp's Fourier series is
+# amplitude 1/n on every harmonic. The standalone drew the ramp
+# directly, which is a mathematically infinite harmonic series and so
+# the single worst aliaser in the set. Sixteen partials is already
+# brighter than anything else here and is band-limitable.
+PARTIALS = {
+    "Sawtooth": tuple((n, 1.0 / n) for n in range(1, 17)),
+
+    # Fuller principal + mixture chorus. Real organ "depth" comes from
+    # many simultaneously sounding pipes at different pitches (a
+    # chorus), not from one pipe's tone color.
+    "Organ": ((1, 1.00),      # 8'   unison (fundamental)
+              (2, 0.75),      # 4'   octave
+              (3, 0.50),      # 2 2/3' twelfth (quint)
+              (4, 0.40),      # 2'   fifteenth
+              (5, 0.25),      # 1 3/5' tierce
+              (6, 0.20),      # 1 1/3' larigot
+              (8, 0.15),      # 1'   twenty-second
+              (9, 0.10),      # mixture rank
+              (10, 0.08),     # mixture rank
+              (12, 0.05)),    # mixture top rank
+
+    # Bells contain strong NON-INTEGER partials. This matters far more
+    # than adding ordinary harmonics, and it is why _sine_at
+    # interpolates rather than rounding to the nearest table entry.
+    "Bell": ((1, 1.00), (2.71, 0.55), (4.07, 0.32),
+             (5.83, 0.22), (7.91, 0.12)),
+
+    # Young's plucked-string theorem: amplitude of harmonic n is
+    # proportional to sin(n*pi*p)/n for fractional pluck position p. A
+    # harpsichord plectrum plucks close to the bridge (p ~ 1/8), which
+    # is what makes it tinny and bright rather than round. For p = 1/8:
+    "Pluck": ((1, 1.00), (2, 0.92), (3, 0.81),
+              (4, 0.65), (5, 0.48), (6, 0.31)),
+
+    # Piano strings are not perfectly harmonic -- the slightly sharp
+    # upper partials are what stop it sounding like an organ.
+    "Piano": ((1, 1.00), (2.01, 0.62), (3.02, 0.38), (4.04, 0.24),
+              (5.08, 0.16), (6.13, 0.10), (7.20, 0.06)),
+
+    # Same theorem as Pluck, but classical fingerstyle: nylon strings
+    # plucked closer to mid-string (p ~ 1/5, over the soundhole) rather
+    # than near the bridge. n=5 is absent because plucking at exactly
+    # the 1/5 point places a node there, so the 5th harmonic physically
+    # cannot be excited -- not a simplification.
+    "Guitar": ((1, 1.00), (2, 0.81), (3, 0.54), (4, 0.25), (6, 0.17)),
+
+    # Strong fundamental, controlled upper harmonics: thick without
+    # becoming buzzy.
+    "Bass": ((1, 1.00), (2, 0.48), (3, 0.22), (4, 0.10)),
+
+    # The purest tone in the orchestra -- genuinely poor in harmonics,
+    # just enough above the fundamental to avoid a bare sine. Keep this
+    # weak; adding louder harmonics is not what makes a flute a flute.
+    "Flute": ((1, 1.00), (2, 0.15), (3, 0.07),
+              (4, 0.03), (5, 0.015), (6, 0.008)),
+
+    # A closed cylindrical pipe, hence dominated by ODD harmonics.
+    # Weighted toward the chalumeau register, where the fundamental
+    # carries most of the energy -- the warm, hollow, bass-leaning low
+    # register rather than the brighter clarion.
+    "Clarinet": ((1, 1.00), (2, 0.08), (3, 0.55), (4, 0.10),
+                 (5, 0.30), (7, 0.14), (9, 0.08)),
+
+    # Among the brightest brass: the cylindrical bore after the
+    # mouthpiece permits strong nonlinear wave-steepening down the tube,
+    # pushing energy into high harmonics far more than a conical bore
+    # like a flugelhorn. Which also makes it the set's worst aliaser
+    # after Sawtooth, and the instrument BANDS below helps most.
+    "Trumpet": ((1, 1.00), (2, 0.85), (3, 0.72), (4, 0.58), (5, 0.46),
+                (6, 0.36), (7, 0.27), (8, 0.20), (9, 0.14), (10, 0.09)),
+
+    # Many harmonics, but less aggressive high-frequency content than
+    # brass.
+    "Strings": ((1, 1.00), (2, 0.72), (3, 0.50), (4, 0.35),
+                (5, 0.24), (6, 0.16), (7, 0.10), (8, 0.06)),
+}
+
+
+# ---------------- BANDS: per-octave band-limited tables ----------------
+#
+# THE ALIASING FIX. A wavetable's harmonics scale with the note, so
+# harmonic n of a note at f lands at n*f whether or not that fits under
+# Nyquist. At 12000 Hz Nyquist is 6000, so Trumpet's 10th harmonic
+# exceeds it above 600 Hz and folds back as inharmonic grit that gets
+# worse the higher you play. One table cannot avoid this: the content
+# that aliases up high is the same content that makes it sound right
+# down low.
+#
+# So each instrument gets FOUR tables instead of one, each holding only
+# the partials that stay under ANTIALIAS_HZ for the highest note in its
+# band. Voice.note_on picks the band from the note's frequency. Low
+# notes keep the full spectrum and sound exactly as before; high notes
+# lose the partials that would have aliased anyway, so they get duller
+# rather than dirtier. Dull is a sound; aliasing is a fault.
+#
+# Cost is 11 instruments x 4 bands x 512 bytes = ~22 KB, which is
+# affordable only because the drum bank is gone -- it alone was ~150 KB.
+# Boot cost is near zero thanks to _SINE above.
+#
+# Band tops are octave boundaries. The last is C7, the top of the
+# playable range (octave 6, degree 7), since that band has no natural
+# ceiling.
+ANTIALIAS_HZ = 5400          # matches CUTOFF_MAX_HZ, ~10% under Nyquist
+BAND_TOP_HZ = (262.0, 523.0, 1046.0, 2093.0)
+N_BANDS = len(BAND_TOP_HZ)
+
+
+def make_band(partials, top_hz):
+    """One band-limited table: every partial whose frequency stays under
+    ANTIALIAS_HZ at `top_hz`, summed and peak-normalized to int16.
+
+    NORMALIZED PER BAND, not once per instrument. Dropping partials
+    genuinely lowers a waveform's peak, so scaling every band by the
+    parent's factor would make the same instrument quieter as you played
+    higher -- a level change riding on top of a timbre change, which
+    reads as the keyboard going weak at the top rather than as
+    band-limiting. Per-band normalization keeps perceived loudness even
+    across the range.
+
+    At least the fundamental always survives: max_n can fall below 1 for
+    a high enough band, and a table of zeroes is a silent instrument.
+
+    BUILT IN PLACE, no intermediate lists -- a 256-element list of boxed
+    floats is ~5 KB of transient garbage, and this now runs 44 times
+    rather than 11. Fill at TABLE_AMP scale tracking the integer peak,
+    then rescale in place. The rescale multiply is bounded by
+    TABLE_AMP * TABLE_AMP = 1.024e9, just inside MicroPython's 31-bit
+    small-int ceiling, so raising TABLE_AMP above 32767 would start
+    allocating big ints here."""
+    max_n = ANTIALIAS_HZ / top_hz
+
+    kept = []
+    for n, amp in partials:
+        if n <= max_n:
+            kept.append((n, amp))
+    if not kept:
+        kept = [(partials[0][0], partials[0][1])]
+
+    tbl = array("h", bytearray(TABLE_LEN * 2))
+
+    peak = 0
+    for i in range(TABLE_LEN):
+        v = 0.0
+        for n, amp in kept:
+            v += amp * _sine_at(n * i)
+        s = int(v * TABLE_AMP)
+        # The un-normalized sum can exceed TABLE_AMP before rescaling,
+        # so clamp into int16 range on the way into the array rather
+        # than letting the assignment overflow.
+        if s > 32767:
+            s = 32767
+        elif s < -32768:
+            s = -32768
+        tbl[i] = s
+        if s < 0:
+            s = -s
+        if s > peak:
+            peak = s
+
+    if peak > 0 and peak != TABLE_AMP:
+        for i in range(TABLE_LEN):
+            tbl[i] = tbl[i] * TABLE_AMP // peak
+
+    return tbl
+
+
+# Built one band at a time with a collection between, rather than as one
+# nested comprehension: each make_band call churns transient floats, and
+# 44 of them back to back would leave that garbage interleaved with the
+# tables that survive.
+WAVETABLES = {}
+for _name in ("Sawtooth", "Organ", "Bell", "Pluck", "Piano", "Guitar",
+              "Bass", "Flute", "Clarinet", "Trumpet", "Strings"):
+    _bands = []
+    for _b in range(N_BANDS):
+        try:
+            _bands.append(make_band(PARTIALS[_name], BAND_TOP_HZ[_b]))
+        except MemoryError:
+            # ~22 KB total across the set, so this is never really about
+            # the tables -- report the budget rather than the last straw.
+            raise MemoryError(
+                "out of heap building '" + _name + "' band " + str(_b)
+                + " -- free=" + str(gc.mem_free()) + ", largest run="
+                + str(_largest_free_run()) + ". Tables are 512 bytes each,"
+                + " so this is the Looper: run from FLASH rather than"
+                + " pasting into the REPL, and if it is already on flash"
+                + " lower LOOP_SECONDS. Dropping N_BANDS to 2 buys back"
+                + " ~11 KB at the cost of aliasing in the upper octaves.")
+        gc.collect()
+    WAVETABLES[_name] = tuple(_bands)
+_name = None
+_bands = None
+_b = None
+_SINE = None      # 256 boxed floats, only needed while building
+gc.collect()
+
+
+def band_for(freq):
+    """Which band-limited table a note at `freq` should play from.
+
+    Chosen ONCE at note_on and held for the life of the voice. A note
+    does not change band while sounding, so a sustained note cannot
+    change timbre under you -- and render_voice never has to check."""
+    b = 0
+    while b < N_BANDS - 1 and freq > BAND_TOP_HZ[b]:
+        b += 1
+    return b
+
+
+# (attack_ms, decay_ms, sustain_level, release_ms), straight from the
+# standalone. Every key here must exist in PARTIALS and vice versa --
+# Voice.note_on looks the same name up in both, and a name present in
+# only one silently falls back to DEFAULT_SAMPLE's other half, which
+# sounds like the right instrument with the wrong envelope (or the
+# reverse) and is miserable to spot by ear.
+ENVELOPES = {
+    # Synth
+    "Sawtooth": (15, 120, 0.75, 200),
+
+    # Instruments
+    "Organ":    (12,  40, 0.97, 400),
+    "Bell":     (1,  400, 0.22, 1900),
+    "Pluck":    (2,  200, 0.09, 90),
+
+    "Piano":    (2,  450, 0.12, 450),
+    "Guitar":   (3,  100, 0.25, 800),
+    "Bass":     (3,  190, 0.15, 90),
+
+    "Flute":    (90, 100, 0.92, 240),
+    "Clarinet": (20,  45, 0.94, 150),
+    "Trumpet":  (25,  50, 0.85, 160),
+    "Strings":  (140, 100, 0.92, 550),
+}
+
+# The one name guaranteed to resolve in both dicts, used by the .get()
+# fallbacks in Voice.note_on so a preset naming a sample that no longer
+# exists gets a sound instead of a KeyError mid-set. Sawtooth because it
+# is also index 0 of SAMPLE_NAMES, so shift_sample's fallback and this
+# one agree.
+DEFAULT_SAMPLE = "Sawtooth"
+
+# Cycle order for '*' (forward) and '7' (back).
+SAMPLE_NAMES = (
+    "Sawtooth", "Organ", "Bell", "Pluck", "Piano", "Guitar", "Bass",
+    "Flute", "Clarinet", "Trumpet", "Strings",
+)
+
+
+def shift_sample(name, direction):
+    """Cycle to the next/previous instrument name. Falls back to index 0
+    (DEFAULT_SAMPLE) if `name` is not recognized, so a stale preset value
+    -- "Drums", say, from a saved state written by an older build --
+    cannot get this stuck."""
+    try:
+        idx = SAMPLE_NAMES.index(name)
+    except ValueError:
+        idx = 0
+    idx = (idx + direction) % len(SAMPLE_NAMES)
+    return SAMPLE_NAMES[idx]
 
 
 # ============================================================
 # 8 NOTE BUTTONS
 # ============================================================
-# Defined here, ahead of DRUM KIT below, because DrumVoice's pool is
-# sized off NUM_VOICES -- definition must precede use.
 
 BUTTON_PINS = (15, 14, 13, 12, 11, 10, 9, 8)
 buttons = [Pin(p, Pin.IN, Pin.PULL_UP) for p in BUTTON_PINS]
@@ -253,269 +657,10 @@ key_bits = bytearray(8)
 prev_key_bits = bytearray(8)
 
 # Which button index (0-7) was most recently note-on'd, for Melodic
-# Minor's ascending/descending 6th & 7th (see MELODIC MINOR in the
-# module docstring). None means "no direction yet" -- treated as
-# ascending. Reset to None on any edit that changes what a button index
-# means: key, octave, mode, or preset switch, so a melodic line's
-# direction can't leak across an edit that changed the scale under it.
+# Minor's ascending/descending 6th & 7th. None means "no direction yet"
+# -- treated as ascending. Reset to None on any edit that changes what a
+# button index means: key, octave, mode, or preset switch.
 last_degree_index = None
-
-
-# ============================================================
-# DRUM KIT  (one-shot sample playback)
-# ============================================================
-# Structurally different from every instrument above: those are TUNED,
-# LOOPING wavetables (one short cycle repeated at a pitch-dependent
-# rate, sustained while held). A drum hit is a one-shot: a long,
-# non-looping recording that plays exactly once and stops itself when
-# the sample runs out, regardless of button state. No sustain stage, no
-# per-scale-degree pitch.
-#
-# Forcing one-shot playback through Voice's phase/TABLE_LEN-wrap
-# machinery would need per-sample branches in render_voice's hot loop
-# for a case that doesn't apply to the other 13 instruments. Cheaper to
-# give drums their own voice type (DrumVoice) and render function
-# (render_drum_voice), mixed into the same mix_buf.
-#
-# Fixed mapping regardless of preset key/octave/mode: 1=Kick, 2=Snare,
-# 3=Hat Closed, 4=Hat Open, 5=Clap, 6=Tom Low, 7=Tom Mid, 8=Crash.
-# Selecting "Drums" as the sample bypasses build_scale_freqs() entirely
-# for note-on; see the main loop's note button section.
-#
-# Samples are PRECOMPUTED offline (generate_drums.py, not shipped to the
-# Pico) and loaded as flat .wav files rather than synthesized at boot --
-# generating that much noise/sine-sweep DSP in interpreted MicroPython
-# would cost seconds of unpredictable boot time; loading files is
-# effectively instant.
-
-DRUM_FILES = (
-    "kick.wav", "snare.wav", "hat_closed.wav", "hat_open.wav",
-    "clap.wav", "tom_low.wav", "tom_mid.wav", "crash.wav",
-)
-
-
-def _load_wav_samples(path):
-    """Read a 16-bit mono PCM .wav file's sample data into an array('h').
-
-    Skips the RIFF/fmt header by finding the 'data' chunk rather than
-    hardcoding a 44-byte offset, so it survives a future regeneration
-    that adds metadata chunks.
-
-    Raises loudly at boot (not mid-performance) if a file is missing or
-    malformed -- fail early rather than play garbage or silence on stage.
-    The fmt chunk IS checked: render_drum_voice copies samples straight
-    into the mix with no rate conversion and no channel handling, so a
-    44.1 kHz or stereo file does not error, it just plays at the wrong
-    pitch and half speed. That is a miserable thing to debug on stage
-    and cheap to catch here.
-
-    Note the rate check is also what makes SAMPLE_RATE non-negotiable
-    without regenerating the kit: these wavs were rendered at 12000 Hz,
-    so dropping the project to 11025 to match the standalone synth would
-    raise here on kick.wav and never reach the main loop."""
-    with open(path, "rb") as f:
-        header = f.read(12)
-        if header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
-            raise RuntimeError(path + ": not a RIFF/WAVE file")
-
-        raw = None
-        fmt_seen = False
-
-        # Walk chunks until 'data' is found. RIFF chunks are word
-        # aligned: an odd-sized chunk is followed by one pad byte that
-        # is NOT counted in chunk_size. Skipping only chunk_size bytes
-        # leaves the reader one byte out of step and every subsequent
-        # chunk id reads as garbage.
-        while True:
-            chunk_id = f.read(4)
-            if len(chunk_id) < 4:
-                raise RuntimeError(path + ": no data chunk found")
-            size_bytes = f.read(4)
-            if len(size_bytes) < 4:
-                raise RuntimeError(path + ": truncated chunk header")
-            chunk_size = int.from_bytes(size_bytes, "little")
-            pad = chunk_size & 1
-
-            if chunk_id == b"fmt ":
-                fmt = f.read(chunk_size)
-                audio_format = int.from_bytes(fmt[0:2], "little")
-                channels = int.from_bytes(fmt[2:4], "little")
-                rate = int.from_bytes(fmt[4:8], "little")
-                bits = int.from_bytes(fmt[14:16], "little")
-                if audio_format != 1 or bits != 16 or channels != 1:
-                    raise RuntimeError(
-                        path + ": need 16-bit mono PCM, got format "
-                        + str(audio_format) + "/" + str(bits) + "-bit/"
-                        + str(channels) + "ch")
-                if rate != SAMPLE_RATE:
-                    raise RuntimeError(
-                        path + ": sample rate " + str(rate) + " != "
-                        + str(SAMPLE_RATE) + " (no resampling on the Pico)")
-                fmt_seen = True
-                if pad:
-                    f.read(1)
-
-            elif chunk_id == b"data":
-                if chunk_size & 1:
-                    raise RuntimeError(
-                        path + ": data chunk size not a multiple of 2 bytes")
-                raw = f.read(chunk_size)
-                if len(raw) != chunk_size:
-                    raise RuntimeError(
-                        path + ": data chunk truncated (" + str(len(raw))
-                        + " of " + str(chunk_size) + " bytes)")
-                break
-
-            else:
-                f.read(chunk_size + pad)   # metadata etc., skip it
-
-    if not fmt_seen:
-        raise RuntimeError(path + ": no fmt chunk before data")
-
-    return array("h", raw)
-
-
-# Where the .wav files live on the Pico's flash filesystem. Loaded AFTER
-# the Looper (see AUDIO CONSTANTS + LOOPER at the top) for the same
-# reason WAVETABLES is: the Looper's big allocation needs the heap still
-# clean, so smaller allocations happen once that's safely done.
-#
-# ABSOLUTE path, leading slash, deliberately. A relative "drums/"
-# resolves against the current working directory, which is not the same
-# thing depending on how this file got run (pasted into the REPL,
-# `mpremote run`, or auto-started from flash). "/drums/" is the same
-# directory in all three cases.
-DRUM_KIT_DIR = "/"
-
-# LOADED BIGGEST FIRST, then reordered back into button order.
-#
-# Loading a wav costs 2x its size for a moment -- f.read() hands back the
-# raw bytes and array("h", raw) copies them into a second block of the
-# same size -- and only 1x once the bytes are dropped. So the whole bank
-# fits iff  total + largest <= free, and the ORDER decides whether that
-# peak lands on an empty heap or one that seven samples have already
-# carved up. Ascending order fails on the last (largest) file with plenty
-# of total room left; descending order takes the big hit first and then
-# only needs small ones. Same resident memory either way, strictly better
-# odds of getting there.
-#
-# Sizes are read first so the whole set can be checked BEFORE anything is
-# allocated -- an up-front number you can act on beats a MemoryError
-# seven files deep.
-
-_sizes = []
-for _i in range(len(DRUM_FILES)):
-    _path = DRUM_KIT_DIR + DRUM_FILES[_i]
-    try:
-        _sizes.append((os.stat(_path)[6], _i))
-    except OSError as e:
-        raise OSError("cannot open " + _path + " (errno " + str(e.args[0])
-                      + ") -- is " + DRUM_KIT_DIR
-                      + " a directory with all 8 wavs in it?")
-
-_sizes.sort()
-_sizes.reverse()                      # biggest first
-
-gc.collect()
-_need = 0
-for _sz, _i in _sizes:
-    _need += _sz
-_need += _sizes[0][0]                 # the transient peak on the largest
-_free = gc.mem_free()
-
-if _need > _free:
-    # Every 0.5 s of LOOP_SECONDS is 0.5 * SAMPLE_RATE * 2 bytes * 2
-    # buffers = 24000 bytes at 12000 Hz, so the shortfall converts
-    # straight into the number of half-seconds of loop to give back.
-    _short = _need - _free
-    raise MemoryError(
-        "drum bank needs ~" + str(_need) + " bytes (" + str(_need - _sizes[0][0])
-        + " resident + " + str(_sizes[0][0]) + " peak on "
-        + DRUM_FILES[_sizes[0][1]] + "), only " + str(_free)
-        + " free -- short by " + str(_short) + ". Trim the longest samples, or"
-        + " drop LOOP_SECONDS by " + str((_short + 23999) // 24000 * 0.5) + " s")
-
-_slots = [None] * len(DRUM_FILES)
-for _sz, _i in _sizes:
-    _path = DRUM_KIT_DIR + DRUM_FILES[_i]
-    try:
-        _slots[_i] = _load_wav_samples(_path)
-    except OSError as e:
-        raise OSError("cannot open " + _path + " (errno " + str(e.args[0])
-                      + ") -- is " + DRUM_KIT_DIR
-                      + " a directory with all 8 wavs in it?")
-    except MemoryError:
-        # Preflight said it fits, so getting here means fragmentation,
-        # not arithmetic: the bytes are free but not in one run.
-        raise MemoryError(
-            "no contiguous run for " + _path + " (" + str(_sz) + " bytes, "
-            + "needs " + str(2 * _sz) + " to load) -- free=" + str(gc.mem_free())
-            + "; heap is fragmented, lower LOOP_SECONDS")
-
-DRUM_SAMPLES = tuple(_slots)          # back in button order: 0=Kick .. 7=Crash
-_sizes = None
-_slots = None
-_path = None
-gc.collect()
-
-
-class DrumVoice:
-    """One-shot sample playback: no phase-wrap, no ADSR sustain. Plays
-    `sample` forward from `pos` until pos reaches the end, then goes
-    idle on its own -- unlike Voice, note_off() does nothing, because a
-    real drum hit is not "held," it just plays out. __slots__ for the
-    same reason as Voice: no per-instance dict, no GC pressure from dict
-    growth mid-performance."""
-    __slots__ = ("active", "sample", "pos")
-
-    def __init__(self):
-        self.active = False
-        self.sample = None
-        self.pos = 0
-
-    def note_on(self, drum_index):
-        """drum_index is the BUTTON index (0-7), used directly as the
-        DRUM_SAMPLES index -- fixed mapping, no scale/key/octave
-        involved. Re-triggering a still-sounding drum (fast repeated
-        hits) restarts it from 0 rather than layering a second copy --
-        simpler and avoids needing a drum-specific polyphony scheme on
-        top of the existing one-voice-per-button design."""
-        self.sample = DRUM_SAMPLES[drum_index]
-        self.pos = 0
-        self.active = True
-
-    def note_off(self):
-        # Deliberately a no-op: a drum one-shot plays out regardless of
-        # how long the button is held. Present so the main loop's
-        # existing "if pressed: note_on() elif released: note_off()"
-        # shape doesn't need a drum-specific special case there.
-        pass
-
-
-drum_voices = [DrumVoice() for _ in range(NUM_VOICES)]
-
-
-@micropython.native
-def render_drum_voice(v, mix_buf, n_samples):
-    """Mix one drum voice's contribution into mix_buf. Structurally
-    simpler than render_voice: no phase accumulator, no envelope, no
-    interpolation (these are already-recorded samples at the project's
-    own SAMPLE_RATE, not a pitched lookup table being stepped through at
-    an arbitrary rate -- there is nothing to interpolate between). Just
-    copy forward from pos, clamping at the sample's own length."""
-    sample = v.sample
-    pos = v.pos
-    sample_len = len(sample)
-
-    n = 0
-    while n < n_samples and pos < sample_len:
-        mix_buf[n] += sample[pos]
-        pos += 1
-        n += 1
-
-    v.pos = pos
-    if pos >= sample_len:
-        v.active = False
 
 
 # ============================================================
@@ -527,20 +672,21 @@ def render_drum_voice(v, mix_buf, n_samples):
 # position means the value snaps the instant you touch it. The knob
 # always wins.
 #
-# `presets[active_preset]` is the source of truth for pitch/timbre.
-# `state` is a flat mirror rebuilt by sync_state() so the OLED and the
-# website have one object to read.
-#
 # PRESET_FIELDS lists every key a preset owns. sync_state() loops over
 # it instead of hand-writing one line per field, so adding a preset
-# field can't silently forget its sync line -- a bug that's invisible in
-# testing and only shows up on stage as "I changed it but nothing updated."
+# field cannot silently forget its sync line -- a bug invisible in
+# testing that shows up on stage as "I changed it but nothing updated."
+#
+# The two presets start on DIFFERENT instruments so key '3' is audibly a
+# preset switch and not just a transpose. Piano is a safe demo default:
+# mellow enough not to alias in the upper octaves, percussive enough to
+# hear the envelope.
 
 PRESET_FIELDS = ("octave", "key", "sample", "mode")
 
 presets = [
-    {"octave": 4, "key": "C", "sample": "Sine", "mode": "Major"},
-    {"octave": 5, "key": "F", "sample": "Sawtooth", "mode": "Major"},
+    {"octave": 4, "key": "C", "sample": "Piano", "mode": "Major"},
+    {"octave": 5, "key": "F", "sample": "Organ", "mode": "Major"},
 ]
 
 active_preset = 0
@@ -549,7 +695,7 @@ state = {
     "preset": 1,
     "octave": 4,
     "key": "C",
-    "sample": "Sine",
+    "sample": "Piano",
     "mode": "Major",
     "volume": 75,
     "cutoff": 100,          # 100 = filter fully open (bypassed)
@@ -561,7 +707,7 @@ state = {
 
 def sync_state():
     """Copy every preset-owned field into the reported state. Called
-    once per update rather than at every edit site, so the mirror can't
+    once per update rather than at every edit site, so the mirror cannot
     drift out of step with the preset behind it."""
     p = presets[active_preset]
     state["preset"] = active_preset + 1
@@ -584,16 +730,16 @@ adc_channels = (ADC(26), ADC(27))
 # real endpoints from the widest travel seen since power-on: sweep each
 # pot end to end once after boot to calibrate.
 #
-# One entry PER CHANNEL. As single globals this was fine with one pot and
-# silently wrong with two -- both channels would have shared whichever
-# pot happened to swing widest.
+# One entry PER CHANNEL. As single globals this was fine with one pot
+# and silently wrong with two -- both channels would have shared
+# whichever pot happened to swing widest.
 adc_min = [65535] * len(adc_channels)
 adc_max = [0] * len(adc_channels)
 
 # Require this much travel before trusting the learned endpoints. Below
 # it the "range" is just ADC noise a few counts wide, and dividing by it
-# makes the reading snap randomly between 0 and 100. 8000 is ~12% of full
-# scale: well above noise, well below any real pot's travel.
+# makes the reading snap randomly between 0 and 100. 8000 is ~12% of
+# full scale: well above noise, well below any real pot's travel.
 MIN_ADC_SPAN = 8000
 
 VOLUME_DEADBAND = 2   # percent of change required to report a new value
@@ -611,15 +757,15 @@ def read_pot(ch, unswept_default=-1):
     learned range for the rest of the set.
 
     `unswept_default`, if given (0-100), is what this channel reports
-    until it has actually been swept far enough to calibrate. Cutoff
-    passes 100 for it, and that is not cosmetic: the lowpass sits in
-    front of everything in the chain, and an UNWIRED or merely untouched
-    GP27 floats, so the raw fallback below would scale noise into an
-    arbitrary cutoff and quietly muffle the entire instrument. Failing
-    open means a miswired filter knob costs you the filter, not the
-    sound. Volume passes nothing and keeps the raw fallback, because for
-    volume the raw reading of a wired pot is already close to its true
-    position and jumping to a default would be the worse surprise."""
+    until it has been swept far enough to calibrate. Cutoff passes 100,
+    and that is not cosmetic: the lowpass sits in front of everything in
+    the chain, and an UNWIRED or merely untouched GP27 floats, so the raw
+    fallback would scale noise into an arbitrary cutoff and quietly
+    muffle the entire instrument. Failing open means a miswired filter
+    knob costs you the filter, not the sound. Volume passes nothing and
+    keeps the raw fallback, because a wired pot's raw reading is already
+    close to its true position and jumping to a default would be the
+    worse surprise."""
     a = adc_channels[ch]
     raw = (a.read_u16() + a.read_u16() + a.read_u16() + a.read_u16()) >> 2
 
@@ -652,8 +798,6 @@ oled.init(i2c)
 # ============================================================
 # I2S AUDIO OUTPUT
 # ============================================================
-# SAMPLE_RATE, BUF_SAMPLES and IBUF_BLOCKS are defined at the top of the
-# file, next to the Looper that has to be allocated before anything else.
 
 audio = I2S(
     0,
@@ -675,7 +819,8 @@ audio = I2S(
 # Envelope stages as ints, not strings. const() inlines these as literal
 # integers at compile time, so the stage comparisons in render_voice --
 # which run once per sample per voice, up to 2048 times per block --
-# become integer compares instead of object compares.
+# become integer compares instead of object compares. The standalone
+# compared strings here.
 _IDLE = const(0)
 _ATTACK = const(1)
 _DECAY = const(2)
@@ -685,57 +830,104 @@ _RELEASE = const(4)
 
 # ---------------- Fixed-point scales for the voice render ----------------
 #
-# render_voice used to carry a float phase, a float envelope level, and a
-# float interpolation fraction -- the shape the standalone synth still
-# uses. MicroPython boxes every float on the heap, so the inner loop --
-# 256 iterations per voice per block, 2048 with 8 voices held -- was
-# allocating constantly and running the slowest arithmetic the
-# interpreter has. That is what made CPU load track voice count, and
-# voice count is exactly the axis the garbling moved along.
+# The standalone carries a float phase, a float envelope level, and does
+# `int(phase) % TABLE_LEN` every sample. MicroPython boxes every float on
+# the heap, so that inner loop -- 256 iterations per voice per block,
+# 2048 with 8 voices held -- allocates constantly and runs the slowest
+# arithmetic the interpreter has. That is what made CPU load track voice
+# count, and voice count is exactly the axis the garbling moved along.
 #
-# The standalone gets away with floats because it runs 1024-sample blocks
-# at 11025 Hz behind a 4-block ibuf: a 93 ms budget and ~460 ms of queue
-# to hide any overrun in. This build spends that latency on playability
+# The standalone gets away with it because it runs 1024-sample blocks at
+# 11025 Hz behind a 4-block ibuf: a 93 ms budget and ~460 ms of queue to
+# hide any overrun in. This build spends that latency on playability
 # instead, which only works if the render is cheap. So the arithmetic
-# below is integer -- SAME algorithm, same envelope shape, same tables,
-# no allocation, no GC pressure -- and the whole loop stays inside
-# MicroPython's 31-bit small-int range (+-1.07e9) so nothing silently
-# promotes to a heap-allocated big int.
+# below is integer -- SAME algorithm, same envelope shape, no allocation,
+# no GC pressure -- and the whole loop stays inside MicroPython's 31-bit
+# small-int range (+-1.07e9) so nothing silently promotes to a big int.
 #
 # PHASE -- Q16.16. phase_inc = freq * TABLE_LEN * 65536 / SAMPLE_RATE.
 # Top note (octave 6, degree 7 = C7, 2093 Hz) gives ~2.9e6, far below
 # _PHASE_WRAP, which is what lets the wrap stay a single subtract rather
-# than a modulo.
+# than the standalone's modulo.
 _PHASE_BITS = const(16)
 #
-# LITERAL, not const(TABLE_LEN << 16). MicroPython's const() folds at
-# COMPILE time, so its argument must be a literal or another const
-# declared in THIS module -- TABLE_LEN is imported from instruments.py,
-# which makes it a runtime name and raises "SyntaxError: not a constant".
-# The assert below is the price of hardcoding it: it costs one comparison
-# once at boot and makes a TABLE_LEN change fail loudly here instead of
-# detuning every note by a factor of two.
-_PHASE_WRAP = const(16777216)             # TABLE_LEN(256) << 16
-assert TABLE_LEN == 256, "_PHASE_WRAP hardcodes TABLE_LEN=256"
+# TABLE_LEN is a local const (see INSTRUMENTS above), not an imported
+# runtime name, so const() can fold this directly instead of needing a
+# hardcoded literal plus a boot-time assert to catch drift.
+_PHASE_WRAP = const(TABLE_LEN << 16)
 
 # INTERPOLATION FRACTION -- Q8, NOT the full Q16. (s1 - s0) can reach
 # 64000, and 64000 * 65535 = 4.2e9 overflows a small int and would start
-# allocating big ints inside the audio loop. 64000 * 255 = 1.6e7 is
-# safe, and 256 steps between adjacent table entries is already finer
-# than the table's own 16-bit resolution can express.
+# allocating big ints inside the audio loop. 64000 * 255 = 1.6e7 is safe,
+# and 256 steps between adjacent table entries is already finer than the
+# table's own 16-bit resolution can express.
 _FRAC_BITS = const(8)
 _FRAC_MASK = const(255)
 
 # ENVELOPE LEVEL -- Q23 for the accumulator, used at Q15 for the multiply.
-# Q15 alone is too coarse to ACCUMULATE in: Bell's release is 1900 ms
-# from a sustain of 0.22, which at 12000 Hz is 22800 samples of decay --
-# a Q15 step would round to 0, get forced to 1, and cut Bell's tail to a
-# third of its length. Q23 gives the step 256x the resolution, and
-# shifting down by 8 at the point of use keeps the multiply in range:
-# 32000 * 32768 = 1.048e9, just under the 1.07e9 small-int ceiling.
+# Q15 alone is too coarse to ACCUMULATE in over a long release -- Q23
+# gives the step 256x the resolution, and shifting down by 8 at the point
+# of use keeps the multiply in range: 32000 * 32768 = 1.048e9, just under
+# the 1.07e9 small-int ceiling.
+#
+# The long releases in ENVELOPES are exactly the case this was chosen
+# for: Bell at 1900 ms is 22800 samples, and at Q15 that release step
+# would floor to zero and max(1, ...) in note_on would stretch the tail
+# to nonsense. At Q23 it comes out at 80 per sample, a real ramp.
 _LVL_BITS = const(23)
 _LVL_ONE = const(8388608)                 # 1 << 23
 _LVL_TO_Q15 = const(8)                    # >> this before multiplying
+
+# Absolute floor at which a release gives up and snaps to zero: -54 dBFS
+# of the envelope, before MIX_HEADROOM and the volume knob touch it. An
+# exponential never actually reaches zero, so something has to end it,
+# and the alternative -- waiting for the +1 in the step below to walk it
+# down one unit at a time -- would leave a Bell inaudibly ringing for
+# seconds while its voice stayed allocated.
+_ENV_FLOOR = const(16384)                 # 1 << 14
+
+
+def _env_shifts(n_samples):
+    """Two shift counts whose reciprocals sum to the per-sample fraction
+    an exponential needs to fall to 1% of its starting gap in n_samples.
+
+    WHY SHIFTS AND NOT A MULTIPLY. Exponential decay is level *= r each
+    sample, and r is very close to 1 -- Bell's release needs 0.99980, so
+    about 16 fractional bits. level is Q23 and peaks at 8388608, and
+    8388608 * 65536 = 5.5e11, which blows straight past MicroPython's
+    31-bit small-int ceiling and starts allocating big ints inside the
+    audio loop. That is the one thing this whole file is arranged to
+    avoid.
+
+    A sum of two reciprocal powers of two -- level -= (level >> a) +
+    (level >> b) -- is pure integer shifting, cannot overflow at any
+    level, and lands within a few percent of any ratio we need. One
+    shift alone would only give ratios a factor of 2 apart, i.e. decay
+    times off by up to 100%; the second shift brings that to under 40%,
+    which for envelope times that were chosen by ear anyway is well
+    inside taste.
+
+    `a` is clamped at 13 so that (level >> a) is still non-zero near
+    _ENV_FLOOR -- otherwise a long release would stop moving before it
+    reached the floor. `b` needs no clamp: if (level >> b) rounds to
+    zero, `a` is still carrying the decay.
+
+    Runs once per keypress, so the float maths here costs nothing."""
+    d = 1.0 - 0.01 ** (1.0 / n_samples)
+
+    a = 1
+    while a < 13 and (1.0 / (1 << a)) > d:
+        a += 1
+
+    rem = d - 1.0 / (1 << a)
+    if rem <= 0:
+        b = 30            # `a` already overshoots; make `b` contribute nothing
+    else:
+        b = 1
+        while b < 30 and (1.0 / (1 << b)) > rem:
+            b += 1
+
+    return a, b
 
 
 class Voice:
@@ -743,13 +935,16 @@ class Voice:
     # access, and no dict growth to trigger GC mid-note.
     __slots__ = (
         "active", "table", "phase", "phase_inc", "stage", "level",
-        "attack_step", "decay_step", "sustain_level", "release_step",
+        "attack_step", "sustain_level",
+        "decay_a", "decay_b", "decay_end",
+        "release_a", "release_b", "release_end",
     )
 
     def __init__(self):
         # All integers -- see the fixed-point scale block above. Seeding
-        # these as floats would let the very first note run one block of
-        # mixed int/float arithmetic before note_on() overwrote them.
+        # these as floats (as the standalone does) would let the very
+        # first note run one block of mixed int/float arithmetic before
+        # note_on() overwrote them.
         self.active = False
         self.table = None
         self.phase = 0
@@ -757,27 +952,48 @@ class Voice:
         self.stage = _IDLE
         self.level = 0
         self.attack_step = 0
-        self.decay_step = 0
         self.sustain_level = 0
-        self.release_step = 0
+        self.decay_a = 1
+        self.decay_b = 30
+        self.decay_end = 0
+        self.release_a = 1
+        self.release_b = 30
+        self.release_end = _ENV_FLOOR
 
     def note_on(self, freq, instrument):
         # Float maths is fine HERE -- note_on runs once per keypress, not
         # once per sample. Everything it stores is an integer, so the
         # render loop never sees a float.
         #
-        # The two .get() fallbacks land on "Sine", which is why
-        # instruments.py must always define it: a preset naming a sample
-        # that no longer exists gets a plain tone instead of a KeyError
-        # mid-set.
-        self.table = WAVETABLES.get(instrument, WAVETABLES["Sine"])
-        self.phase = 0
+        # The two .get() fallbacks land on DEFAULT_SAMPLE, the one entry
+        # both dicts are guaranteed to have.
+        # Band chosen here, once, from the note's own frequency -- see
+        # BANDS above. render_voice is unchanged and never knows there
+        # is more than one table.
+        self.table = WAVETABLES.get(
+            instrument, WAVETABLES[DEFAULT_SAMPLE])[band_for(freq)]
+
+        # CLICK-FREE RETRIGGER. Hitting a button whose voice is still
+        # sounding -- a repeated note, or one caught mid-release --  used
+        # to slam phase and level both back to 0. Level dropping from
+        # wherever it was to zero in one sample is a step discontinuity,
+        # and so is the waveform jumping to table index 0 mid-cycle.
+        # Two clicks on every repeated note.
+        #
+        # Restarting from the CURRENT phase and level removes both. The
+        # attack then ramps from where the old note was rather than from
+        # silence, which is also what a re-struck string actually does.
+        # A genuinely new note (voice idle) still starts clean at zero.
+        if not self.active or self.stage == _IDLE:
+            self.phase = 0
+            self.level = 0
         # Q16.16 table steps per output sample. Stays well below
         # _PHASE_WRAP for every note in our range, which is what lets
         # render_voice wrap with a single subtract instead of a modulo.
         self.phase_inc = int(freq * TABLE_LEN * 65536 / SAMPLE_RATE)
 
-        a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(instrument, ENVELOPES["Sine"])
+        a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(
+            instrument, ENVELOPES[DEFAULT_SAMPLE])
         a_samples = max(1, int(a_ms * SAMPLE_RATE / 1000))
         d_samples = max(1, int(d_ms * SAMPLE_RATE / 1000))
         r_samples = max(1, int(r_ms * SAMPLE_RATE / 1000))
@@ -787,13 +1003,30 @@ class Voice:
         # max(1, ...) on every step: a step that floors to 0 is a voice
         # that never leaves its stage -- a note stuck on forever, which
         # on stage is worse than any amount of envelope inaccuracy.
+        # Attack stays LINEAR. It runs from zero, where an exponential
+        # has nothing to be proportional to, and a linear ramp up is
+        # what a real attack transient looks like anyway. max(1, ...)
+        # because a step that floors to 0 is a voice that never leaves
+        # its stage -- a note stuck on forever, which on stage is worse
+        # than any amount of envelope inaccuracy.
         self.attack_step = max(1, _LVL_ONE // a_samples)
-        self.decay_step = max(1, (_LVL_ONE - s_level) // d_samples)
         self.sustain_level = s_level
-        self.release_step = max(1, s_level // r_samples)
+
+        # Decay and release are EXPONENTIAL -- see _env_shifts. Each
+        # stage also carries the level at which it gives up, set at the
+        # design point (1% of the distance it had to travel) rather than
+        # at exact arrival, because an exponential's last 1% takes as
+        # long again as the whole audible part.
+        self.decay_a, self.decay_b = _env_shifts(d_samples)
+        self.decay_end = s_level + ((_LVL_ONE - s_level) >> 7)
+
+        self.release_a, self.release_b = _env_shifts(r_samples)
+        r_end = s_level >> 7
+        if r_end < _ENV_FLOOR:
+            r_end = _ENV_FLOOR
+        self.release_end = r_end
 
         self.stage = _ATTACK
-        self.level = 0
         self.active = True
 
     def note_off(self):
@@ -811,7 +1044,7 @@ mix_buf = array("l", [0] * BUF_SAMPLES)
 out_buf = array("h", [0] * BUF_SAMPLES)
 
 # zero_buf exists purely to clear mix_buf with a C-level slice copy
-# instead of 256 interpreted loop iterations doing nothing.
+# instead of the standalone's 256 interpreted stores.
 zero_buf = array("l", [0] * BUF_SAMPLES)
 
 # Written straight to I2S when nothing is sounding, so silence costs one
@@ -819,34 +1052,44 @@ zero_buf = array("l", [0] * BUF_SAMPLES)
 silence_buf = array("h", [0] * BUF_SAMPLES)
 
 # Master headroom divisor. 8 voices at full scale sum to 256000 against a
-# 32000 output ceiling, so some division is mandatory.
+# 32000 output ceiling, so some division is mandatory. The standalone
+# used a flat VOLUME = 80 and simply clipped on any two-note chord.
 #
-# 2.0, NOT 3.0. This is the knob that made the old build sound weak next
-# to the standalone synth, and it is worth being precise about why. The
-# standalone ran a flat 0.8 gain with no divisor at all, so ANY two notes
-# together clipped -- that hard clipping is a real part of why it sounds
-# loud and present rather than polite. 3.0 was set so a three-note chord
-# lands exactly at full scale and never clips, which is correct on paper
-# and about 7 dB quieter per note in the room, with the volume knob
-# already at maximum and nowhere left to go.
+# 2.0 splits the difference: one note peaks at 16000 (half scale, plenty
+# of room to be heard), a two-note chord at full scale, and three or more
+# clip progressively. If it distorts while a loop is playing underneath
+# -- the loop adds as much again on top of the live voices -- go to 3.0
+# or back the volume knob off, which is what a real looper expects.
 #
-# 2.0 splits it: one note peaks at 16000 (half scale, plenty of room to
-# be heard), a two-note chord at full scale, and three or more clip
-# progressively the way the standalone did. If it distorts while a loop
-# is playing underneath -- the loop adds as much again on top of the live
-# voices -- go back to 3.0 or just back the volume knob off, which is
-# what a real looper expects you to do.
+# The tables are peak-normalized, so "full scale" means full scale for
+# every instrument rather than just the sawtooth, and the long-release
+# patches keep old notes summing under new ones. 3.0 is a more likely
+# landing spot here than the arithmetic alone suggests.
 MIX_HEADROOM = 2.0
+
+# Where the soft knee starts, in output units. Below this the output
+# stage is bit-identical to a straight wire; above it the excess is
+# scaled by a quarter.
+#
+# 26000 of 32000, chosen by measurement rather than taste. The knee has
+# to start below the ceiling to soften the APPROACH to it, but every
+# unit below is headroom that gets gently compressed when it did not
+# need to be. Measured on the harmonics that actually matter -- the 7th
+# and above, which are both what makes clipping sound harsh and what
+# folds back as aliasing at this sample rate -- 26000 beats both a hard
+# clip and a lower knee at every overload level, while staying perfectly
+# linear 6000 units further up than a knee at 20000 would.
+_KNEE = const(26000)
 
 # Precomputed Q10 master gain, indexed by volume percent, same shape as
 # CUTOFF_TABLE below.
 #
 # Square law approximates how the ear hears loudness, so the pot feels
 # linear across its travel. Doing that as `x * x / MIX_HEADROOM` inside
-# generate_block meant a float multiply per sample in the output pass --
-# 256 boxed floats per block, in the one function most carefully written
-# to avoid exactly that. Table it once at boot and the whole audio path
-# is integer end to end.
+# generate_block would mean a float multiply per sample in the output
+# pass -- 256 boxed floats per block, in the one function most carefully
+# written to avoid exactly that. Table it once at boot and the whole
+# audio path is integer end to end.
 #
 # Q10 and not Q12, for the same range reason as the filter coefficient:
 # mb[i] reaches ~512000 with 8 voices plus loop playback, and
@@ -863,8 +1106,8 @@ VOL_TABLE = tuple(
 #
 # k is the per-sample fraction of the way the output moves toward the
 # input: k = 1 - exp(-2*pi*fc/fs). Fixed point with a 10-bit scale, so k
-# runs 0..1024 and the per-sample cost is a subtract, a multiply, a
-# shift, and an add -- integer only, no floats in the filter path.
+# runs 0..1024 and the per-sample cost is a subtract, a multiply, a shift
+# and an add -- integer only, no floats in the filter path.
 #
 # Headroom check: |x - y| peaks near 8 voices * 32000 * 2 = 512000, and
 # 512000 * 1024 = 524M, comfortably inside MicroPython's 31-bit small int
@@ -875,9 +1118,8 @@ VOL_TABLE = tuple(
 CUTOFF_MIN_HZ = 60
 # Kept just under Nyquist at the CURRENT SAMPLE_RATE -- this constant
 # must move whenever SAMPLE_RATE does. At 12000 Hz Nyquist is 6000 Hz;
-# 5400 keeps the same ~10% margin the 16000/7200 pair had. Fully open
-# (pct 100) bypasses the filter outright, so the ceiling only shapes the
-# top of the knob's travel.
+# 5400 keeps a ~10% margin. Fully open (pct 100) bypasses the filter
+# outright, so the ceiling only shapes the top of the knob's travel.
 CUTOFF_MAX_HZ = 5400
 
 
@@ -898,7 +1140,28 @@ CUTOFF_TABLE = tuple(_cutoff_k(p) for p in range(101))
 
 # Filter memory, carried across blocks. A per-block reset would put a
 # discontinuity at every block boundary -- a 43 Hz buzz under everything.
-lp_state = 0
+#
+# TWO stages, not one. A single one-pole rolls off at 6 dB/octave, which
+# is so gentle that sweeping the cutoff reads as a tone control rather
+# than a filter -- there is always plenty of signal left an octave above
+# the corner. Cascading two identical one-poles gives 12 dB/octave for
+# one extra multiply and shift PER BLOCK SAMPLE, not per voice, so the
+# cost does not scale with polyphony.
+#
+# The pair is -6 dB at the nominal corner rather than -3, so the same
+# knob position sounds slightly darker than it did. That is the trade,
+# and it is the right way round: the knob now has an audible effect
+# across its whole travel instead of only at the very bottom.
+lp1 = 0
+lp2 = 0
+
+# Smoothed volume and cutoff, moved toward the pot reading a fraction of
+# the way each block rather than jumped to it. A pot step of 2% (the
+# deadband) applied instantly is a gain discontinuity at a block
+# boundary -- the zipper you hear when turning a knob on a cheap synth.
+# Converging over a few blocks puts the change below the audible step.
+vol_q_now = -1        # -1 = uninitialised, snap to the first reading
+k_now = -1
 
 
 @micropython.native
@@ -909,30 +1172,34 @@ def render_voice(v, mix_buf, n_samples):
 
     Every per-sample value is pulled into a local first: self.x lookups
     are among the slowest operations in MicroPython and this loop runs
-    256 times per voice per block.
+    256 times per voice per block. That much the standalone already got
+    right, and it is why its structure survives here.
 
-    LINEAR INTERPOLATION between the two nearest table samples. This is
-    the one thing here the standalone does not do -- it takes
-    int(phase) % TABLE_LEN and reads the nearest entry. Real notes step
-    10-70+ table entries per output sample, far coarser than the table's
-    256-entry resolution, so nearest-neighbour lookup produces a harsh
-    clicking character that worsens with pitch. Interpolating smooths
-    that to the table's actual harmonic content for one extra read,
-    subtract, multiply and shift -- all integer. Keep it.
+    LINEAR INTERPOLATION between the two nearest table samples, which the
+    standalone does not do. Real notes step 10-70+ table entries per
+    output sample, far coarser than the table's 256-entry resolution, so
+    nearest-neighbour lookup produces a harsh clicking character that
+    worsens with pitch. Interpolating smooths that to the table's actual
+    harmonic content for one extra read, subtract, multiply and shift --
+    all integer. It matters most on exactly the harmonically rich tables
+    people will want to play, whose sample-to-sample slopes are steepest.
 
     idx1 wraps to 0 only when idx0 == TABLE_LEN - 1 (right before phase
     itself wraps), handled with one comparison rather than a modulo every
-    sample, since idx0 is kept in [0, TABLE_LEN) by the phase wrap
-    below."""
+    sample, since idx0 is kept in [0, TABLE_LEN) by the phase wrap."""
     table = v.table
     phase = v.phase
     phase_inc = v.phase_inc
     stage = v.stage
     level = v.level
     attack_step = v.attack_step
-    decay_step = v.decay_step
     sustain_level = v.sustain_level
-    release_step = v.release_step
+    decay_a = v.decay_a
+    decay_b = v.decay_b
+    decay_end = v.decay_end
+    release_a = v.release_a
+    release_b = v.release_b
+    release_end = v.release_end
 
     n = 0
     while n < n_samples:
@@ -954,13 +1221,22 @@ def render_voice(v, mix_buf, n_samples):
                 level = _LVL_ONE
                 stage = _DECAY
         elif stage == _DECAY:
-            level -= decay_step
-            if level <= sustain_level:
+            # Exponential toward the sustain floor: the step is a
+            # fraction of the REMAINING GAP, not a constant. Same cost
+            # as the old linear subtract -- two shifts and two adds, all
+            # integer, no overflow possible at any level.
+            #
+            # The +1 is a stall guard. Near the end the shifts can both
+            # round to zero, and without it the stage would sit one unit
+            # above its target forever with the voice still allocated.
+            gap = level - sustain_level
+            level -= (gap >> decay_a) + (gap >> decay_b) + 1
+            if level <= decay_end:
                 level = sustain_level
                 stage = _SUSTAIN
         elif stage == _RELEASE:
-            level -= release_step
-            if level <= 0:
+            level -= (level >> release_a) + (level >> release_b) + 1
+            if level <= release_end:
                 level = 0
                 stage = _IDLE
 
@@ -994,7 +1270,7 @@ def generate_block(volume_pct, cutoff_pct):
 
     The loop tap sits after the filter so effects bake into a recording,
     and before volume so the knob still rides the loop."""
-    global lp_state
+    global lp1, lp2, vol_q_now, k_now
 
     # Bind globals to locals once. Even under @native these are dict
     # lookups otherwise, and they would happen on all 256 iterations.
@@ -1002,12 +1278,38 @@ def generate_block(volume_pct, cutoff_pct):
     ob = out_buf
     n = BUF_SAMPLES
 
-    # Q10 master gain, table lookup -- no float arithmetic anywhere in
-    # this function. See VOL_TABLE.
-    vol_q = VOL_TABLE[volume_pct]
+    # Q10 master gain and filter coefficient, both TABLE LOOKUPS -- no
+    # float arithmetic anywhere in this function. See VOL_TABLE.
+    #
+    # Each is then eased toward its target rather than snapped to it,
+    # a quarter of the remaining distance per block, closing the last
+    # few units exactly so it cannot oscillate by one forever. Three or
+    # four blocks is ~70 ms, far quicker than a hand turns a knob and
+    # far slower than a step you would hear.
+    vol_t = VOL_TABLE[volume_pct]
+    if vol_q_now < 0:
+        vol_q_now = vol_t
+    else:
+        d = vol_t - vol_q_now
+        if d > 3 or d < -3:
+            vol_q_now += d >> 2
+        else:
+            vol_q_now = vol_t
+    vol_q = vol_q_now
 
-    k = CUTOFF_TABLE[cutoff_pct]
-    y = lp_state
+    k_t = CUTOFF_TABLE[cutoff_pct]
+    if k_now < 0:
+        k_now = k_t
+    else:
+        d = k_t - k_now
+        if d > 3 or d < -3:
+            k_now += d >> 2
+        else:
+            k_now = k_t
+    k = k_now
+
+    y1 = lp1
+    y2 = lp2
 
     mb[:] = zero_buf   # C-level clear, not 256 interpreted stores
 
@@ -1015,32 +1317,46 @@ def generate_block(volume_pct, cutoff_pct):
         if voice.active:
             render_voice(voice, mb, n)
 
-    # Drum one-shots mix into the SAME buffer, same signal chain position
-    # (before filter/loop/volume) -- a snare hit gets filtered and can be
-    # looped exactly like a melodic note.
-    for dv in drum_voices:
-        if dv.active:
-            render_drum_voice(dv, mb, n)
-
-    # Pass 1: lowpass, in place.
+    # Pass 1: two cascaded one-poles, in place -- 12 dB/octave.
+    # Range: |x - y| peaks near 8 voices * 32000 * 2 = 512000, and
+    # 512000 * 1024 = 5.2e8, comfortably inside the 31-bit small-int
+    # ceiling. The second stage sees an already-filtered signal, so its
+    # range is strictly smaller than the first's.
     i = 0
     while i < n:
-        y += ((mb[i] - y) * k) >> 10
-        mb[i] = y
+        y1 += ((mb[i] - y1) * k) >> 10
+        y2 += ((y1 - y2) * k) >> 10
+        mb[i] = y2
         i += 1
-    lp_state = y
+    lp1 = y1
+    lp2 = y2
 
     # Loop tap: records what you hear, mixes playback back in.
     looper.process(mb, n)
 
-    # Pass 2: master volume and clip.
+    # Pass 2: master volume, then SOFT-KNEE limit rather than hard clip.
+    #
+    # A hard clip is a corner in the transfer curve, and a corner
+    # generates strong odd harmonics -- which at this sample rate then
+    # alias, so a loud chord got both harshness and inharmonic grit at
+    # once. Above _KNEE the excess is scaled by a quarter instead of
+    # passed straight through, which bends the curve over rather than
+    # breaking it. Below _KNEE -- one note, two notes, most of what you
+    # actually play -- the path is bit-identical to before.
+    #
+    # The final clamp still exists because the knee only buys headroom
+    # up to 4x the excess; past that there is nowhere left to go.
     i = 0
     while i < n:
         total = (mb[i] * vol_q) >> 10
-        if total > 32000:
-            total = 32000
-        elif total < -32000:
-            total = -32000
+        if total > _KNEE:
+            total = _KNEE + ((total - _KNEE) >> 2)
+            if total > 32000:
+                total = 32000
+        elif total < -_KNEE:
+            total = -_KNEE + ((total + _KNEE) >> 2)
+            if total < -32000:
+                total = -32000
         ob[i] = total
         i += 1
 
@@ -1051,21 +1367,27 @@ def generate_block(volume_pct, cutoff_pct):
 
 sync_state()
 oled.displayState(state, looper)
-# displayState only QUEUES pages now, so the first paint needs an
-# explicit drain. flush() is the ~15 ms spike push_one() exists to avoid,
-# which is exactly why it is confined to here -- before the audio loop
-# starts there is no block budget to overrun.
+# displayState only QUEUES pages, so the first paint needs an explicit
+# drain. flush() is the ~15 ms spike push_one() exists to avoid, which is
+# exactly why it is confined to here -- before the audio loop starts
+# there is no block budget to overrun.
 oled.flush()
 looper.update_bar(oled.display)
 
 print("--- Pico 2 W Music Controller | Team 13 ---")
-print("keypad: #/9 key +-  0/8 octave +-  */7 sample +-  6 mode")
+print("keypad: #/9 key +-  0/8 octave +-  */7 instrument +-  6 mode")
 print("        3 preset  5 rec  4 play/pause  1 loop reset")
 print("loop: %.2f s | %d blocks | %d KB" % (
     looper.capacity / SAMPLE_RATE,
     looper.n_blocks,
     looper.capacity * 4 // 1024))     # 2 buffers x 2 bytes per sample
-print("free heap after init:", gc.mem_free())
+print("instruments: %d x %d bands | %d B of tables" % (
+    len(WAVETABLES), N_BANDS, len(WAVETABLES) * N_BANDS * TABLE_LEN * 2))
+# Both numbers, deliberately. The gap between them is the story of every
+# MemoryError this project has hit: a large total with no large run in it
+# is a fragmented heap, which is a loading problem (paste vs. flash), not
+# a size problem.
+print("heap: %d free | %d largest run" % (gc.mem_free(), _largest_free_run()))
 print("#" + json.dumps(state))
 
 oled_dirty = False
@@ -1078,18 +1400,16 @@ json_last_ms = time.ticks_ms()
 # line still goes out on the very first pass after an edit if this much
 # time has already elapsed, which it usually has. What it prevents is a
 # burst: pressing three notes for a chord produces three button edges in
-# three consecutive 16 ms blocks, and printing each one meant three
-# blocking USB writes inside 48 ms of audio. 30 ms is under one frame at
-# 30 fps, so the visualiser cannot tell.
+# three consecutive blocks, and printing each one meant three blocking
+# USB writes. 30 ms is under one frame at 30 fps, so the visualiser
+# cannot tell.
 JSON_MIN_INTERVAL_MS = 30
 
-# Heartbeat rate for loop position while the looper runs. Slower than
-# JSON_MIN_INTERVAL_MS on purpose: this one fires continuously for as
-# long as the loop plays, so it sets the floor on idle serial traffic,
-# whereas change lines are bursty and self-limiting. The visualiser
-# needs a moving loop_pos, but a full OLED redraw at this rate would
-# overrun the audio budget -- so the serial line and the screen are
-# deliberately on separate clocks.
+# Heartbeat rate for loop position while the looper runs. Slower on
+# purpose: this fires continuously for as long as the loop plays, so it
+# sets the floor on idle serial traffic, whereas change lines are bursty
+# and self-limiting. A full OLED redraw at this rate would overrun the
+# audio budget, so the serial line and the screen are on separate clocks.
 JSON_LOOP_INTERVAL_MS = 100
 
 # Collect on our own schedule, in the slack right after write() returns,
@@ -1103,6 +1423,11 @@ GC_EVERY_N_BLOCKS = 20
 # that scheduling collection here is meant to prevent.
 GC_MAX_BLOCKS = 40
 block_count = 0
+
+# Pots are polled every Nth pass rather than every pass -- see the pot
+# section of the main loop. 4 passes is ~85 ms at this block period.
+POT_EVERY_N_BLOCKS = 4
+pot_turn = POT_EVERY_N_BLOCKS     # start due, so the first pass reads them
 
 
 # ============================================================
@@ -1120,41 +1445,28 @@ while True:
         key_bits[i] = 1 if buttons[i].value() == 0 else 0
 
     if key_bits != prev_key_bits:
-        # Drums bypass build_scale_freqs entirely -- button index IS the
-        # drum index (fixed mapping), not a scale degree. See DRUM KIT.
-        is_drums = (preset["sample"] == DRUM_KIT_NAME)
-
         # One frequency computed per newly-pressed button, not the whole
         # scale up front -- Melodic Minor's ascending/descending 6th/7th
-        # is a per-note decision (see MELODIC MINOR docstring) that can't
-        # be precomputed before knowing which button is about to sound.
+        # is a per-note decision (see MELODIC MINOR docstring) that
+        # cannot be precomputed before knowing which button is about to
+        # sound.
         for i in range(NUM_VOICES):
             if key_bits[i] and not prev_key_bits[i]:
-                if is_drums:
-                    drum_voices[i].note_on(i)
-                else:
-                    ascending = (last_degree_index is None
-                                 or i > last_degree_index)
-                    freq = build_scale_freqs(
-                        preset["key"], preset["octave"], preset["mode"],
-                        i, ascending)
-                    voices[i].note_on(freq, preset["sample"])
-                    last_degree_index = i
+                ascending = (last_degree_index is None
+                             or i > last_degree_index)
+                freq = build_scale_freqs(
+                    preset["key"], preset["octave"], preset["mode"],
+                    i, ascending)
+                voices[i].note_on(freq, preset["sample"])
+                last_degree_index = i
             elif prev_key_bits[i] and not key_bits[i]:
-                # NOT dispatched on is_drums, unlike note-on. is_drums
-                # reflects the sample selected RIGHT NOW, but the voice
-                # that needs releasing was started under whatever the
-                # sample was when the button went down. Hold a note on
-                # Strings, press '*' to cycle to Drums, release: the
-                # drums branch would fire, DrumVoice.note_off() is a
-                # no-op, and voices[i] is stranded in SUSTAIN and drones
-                # forever. Preset switching (key '3') can cross the same
-                # boundary. Releasing BOTH is unconditionally safe -- a
-                # drum one-shot ignores note_off by design and an idle
-                # Voice.note_off() is a no-op too -- so there is no
-                # reason to branch here at all.
+                # Unconditional: an idle Voice.note_off() is a no-op, so
+                # there is nothing to guard against. This used to need a
+                # careful non-dispatch on the drum branch -- a note held
+                # while the sample cycled to Drums would otherwise be
+                # stranded in SUSTAIN and drone forever. With one voice
+                # type that whole hazard is gone.
                 voices[i].note_off()
-                drum_voices[i].note_off()
 
         # Mutated in place: a list comprehension here would allocate a
         # fresh 8-element list on every button edge, which is exactly
@@ -1170,20 +1482,30 @@ while True:
 
 
     # --- pots: volume (GP26) and filter cutoff (GP27) -----------------
-    volume = read_pot(POT_VOLUME)
-    if previous_volume == -1 or abs(volume - previous_volume) >= VOLUME_DEADBAND:
-        previous_volume = volume
-        state["volume"] = volume
-        changed = True
+    # Read every POT_EVERY_N_BLOCKS passes, not every pass. Each call is
+    # four ADC conversions, so both pots was eight per block for a value
+    # that then has to move 2% to be reported at all -- work spent
+    # inside the one budget that must not overrun. Every 4th pass is
+    # ~85 ms, far quicker than a hand can turn a knob.
+    pot_turn += 1
+    if pot_turn >= POT_EVERY_N_BLOCKS:
+        pot_turn = 0
+        volume = read_pot(POT_VOLUME)
+        if (previous_volume == -1
+                or abs(volume - previous_volume) >= VOLUME_DEADBAND):
+            previous_volume = volume
+            state["volume"] = volume
+            changed = True
 
-    # Reports 100 (filter open) until GP27 has actually been swept -- see
-    # read_pot. An unwired cutoff knob is now inaudible instead of
-    # muffling the whole set.
-    cutoff = read_pot(POT_CUTOFF, 100)
-    if previous_cutoff == -1 or abs(cutoff - previous_cutoff) >= CUTOFF_DEADBAND:
-        previous_cutoff = cutoff
-        state["cutoff"] = cutoff
-        changed = True
+        # Reports 100 (filter open) until GP27 has actually been swept
+        # -- see read_pot. An unwired cutoff knob is inaudible instead
+        # of muffling the whole set.
+        cutoff = read_pot(POT_CUTOFF, 100)
+        if (previous_cutoff == -1
+                or abs(cutoff - previous_cutoff) >= CUTOFF_DEADBAND):
+            previous_cutoff = cutoff
+            state["cutoff"] = cutoff
+            changed = True
 
 
     # --- keypad -------------------------------------------------------
@@ -1197,8 +1519,8 @@ while True:
         # Key and octave both change what a button INDEX means musically
         # (build_scale_freqs maps index -> degree -> frequency using
         # both), so either edit resets last_degree_index -- otherwise a
-        # Melodic Minor line's ascending/descending state could survive
-        # a transpose that changed what "higher" even refers to.
+        # Melodic Minor line's direction state could survive a transpose
+        # that changed what "higher" even refers to.
         if pressed_key == "#":
             preset["key"] = shift_key(preset["key"], 1)
             last_degree_index = None
@@ -1229,24 +1551,22 @@ while True:
             changed = True
 
         # --- mode ---
-        # Changes the step table build_scale_freqs uses for every
-        # degree, so it resets direction state for the same reason
-        # key/octave do above.
+        # Changes the step table build_scale_freqs uses for every degree,
+        # so it resets direction state for the same reason key/octave do.
         elif pressed_key == "6":
             preset["mode"] = shift_mode(preset["mode"], 1)
             last_degree_index = None
             changed = True
 
         # --- preset select ---
-        # CYCLES (2 presets today), not direct-select -- unlike the old
-        # 1/4 scheme, a single key can't land on a specific preset by
-        # index once there could be more than 2. Notes already sounding
-        # keep the frequency and wavetable they were triggered with --
-        # switching preset must not retune a held chord underneath you.
-        # `preset` is rebound so anything later in this same pass edits
-        # the newly selected one. Switching presets can change key,
-        # octave, AND mode all at once, so this resets direction state
-        # too.
+        # CYCLES (2 presets today), not direct-select, so a single key
+        # cannot land on a specific preset by index once there could be
+        # more than 2. Notes already sounding keep the frequency and
+        # wavetable they were triggered with -- switching preset must not
+        # retune or re-voice a held chord underneath you. `preset` is
+        # rebound so anything later in this same pass edits the newly
+        # selected one. A switch can change key, octave, sample AND mode
+        # at once, so this resets direction state too.
         elif pressed_key == "3":
             active_preset = (active_preset + 1) % len(presets)
             preset = presets[active_preset]
@@ -1325,48 +1645,40 @@ while True:
         bar_pushed = True
 
     # ONE page of I2C per pass, total -- the bar and the status rows share
-    # both the bus and the 16 ms budget, so a pass that already spent
-    # ~3 ms on the bar does not also spend 3 ms here. The queue simply
-    # drains a pass later, which is 16 ms nobody can see.
+    # both the bus and the block budget, so a pass that already spent
+    # ~3 ms on the bar does not also spend 3 ms here. The queue drains a
+    # pass later, which is 21 ms nobody can see.
     oled_pushed = False if bar_pushed else oled.push_one()
 
 
     # --- audio: must run every pass, unconditionally -------------------
-    # Silence fast path: skip the clear, the voice/drum idle checks, and
-    # the filter/loop/scale/clip passes entirely.
+    # Silence fast path: skip the clear, the voice idle checks, and the
+    # filter/loop/scale/clip passes entirely.
     any_active = False
     for voice in voices:
         if voice.active:
             any_active = True
             break
-    if not any_active:
-        # A drum one-shot can be the ONLY thing sounding (no melodic
-        # buttons held), so this must be checked independently -- an
-        # earlier version of this check only scanned `voices` and would
-        # have written silence_buf straight over an active drum hit,
-        # making every drum sound completely silent whenever no melodic
-        # note happened to be held at the same time.
-        for dv in drum_voices:
-            if dv.active:
-                any_active = True
-                break
 
     # Three reasons the output may be non-zero with no key held:
+    #   - a voice is still in RELEASE (Bell runs 1.9 s past the release,
+    #     which is why voice.active, not the button, gates this)
     #   - the looper is playing back or recording
-    #   - the filter still has a tail (lp_state has memory, and at a low
+    #   - the filter still has a tail (both poles have memory, and at a low
     #     cutoff that takes tens of milliseconds to decay)
-    # Cutting to silence_buf while either is true is a step
-    # discontinuity, i.e. a click at the end of every phrase.
+    # Cutting to silence_buf while any is true is a step discontinuity,
+    # i.e. a click at the end of every phrase.
     if (any_active or looper.state != loop.STOPPED
-            or lp_state > 16 or lp_state < -16):
+            or lp2 > 16 or lp2 < -16 or lp1 > 16 or lp1 < -16):
         generate_block(state["volume"], state["cutoff"])
         audio.write(out_buf)
     else:
-        # Integer floor-shift is asymmetric, so a small negative lp_state
-        # can converge to -1 and stay there forever. Zero it explicitly
-        # (inaudible at this magnitude) rather than leaving a permanent
-        # DC offset on the DAC.
-        lp_state = 0
+        # Integer floor-shift is asymmetric, so a small negative filter
+        # state can converge to -1 and stay there forever. Zero both
+        # stages explicitly (inaudible at this magnitude) rather than
+        # leaving a permanent DC offset on the DAC.
+        lp1 = 0
+        lp2 = 0
         audio.write(silence_buf)
 
     # write() has just returned, so the I2S buffer is as full as it gets
