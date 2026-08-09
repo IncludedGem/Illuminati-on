@@ -32,20 +32,29 @@ PIN MAP
 
 KEYPAD
 ------
-    1  preset 1         2  loop reset      3  undo / redo
-    4  preset 2         5  loop record     6  loop play / pause
-    7  wave -           8  octave -        9  key -
-    *  wave +           0  octave +        #  key +
+    1  loop reset       2  (unmapped)       3  cycle preset
+    4  play / pause     5  loop record      6  cycle mode
+    7  sample -         8  octave -         9  key -
+    *  sample +         0  octave +         #  key +
 
-Presets are DIRECT SELECT, not a toggle: 1 always lands on preset 1 and
-4 always on preset 2, so there is never a question of which one you are
-on when you hit the key mid-song.
+Presets and modes both CYCLE on a single key (3 and 6) rather than
+direct-select, unlike the old 1/4 preset scheme -- there are only two
+presets but nine modes, and nine direct-select keys do not exist on a
+3x4 pad. Cycling means the player has to know where they currently are;
+the OLED is the only feedback for that, so it must stay legible.
 
-A preset stores octave, key, and wave -- the three things the keypad
+A preset stores octave, key, sample, AND mode -- everything the keypad
 edits. It deliberately does NOT store volume or cutoff: those are
 physical pots, and a preset cannot move a knob. Recalling a stored
 volume that disagrees with where the knob is sitting means the value
 jumps the instant you touch it. The knob's position always wins.
+
+MODES
+-----
+Nine scales are available per preset: Major, Natural Minor, Melodic
+Minor, Harmonic Minor, Dorian, Phrygian, Lydian, Mixolydian, Locrian.
+Melodic Minor is direction-sensitive (its 6th and 7th degrees differ
+ascending vs. descending) -- see MELODIC MINOR below.
 
 LATENCY BUDGET  (read before touching BUF_SAMPLES or IBUF_BLOCKS)
 -----------------------------------------------------------------
@@ -67,12 +76,28 @@ biggest spike (~25 ms), which is why the full redraw is rate-limited and
 the loop progress bar pushes only its own 128-byte page. Set
 TIMING = True and read the worst-case numbers before going tighter.
 
+MELODIC MINOR
+-------------
+Ascending gets a raised 6th/7th (strong leading tone into the octave);
+descending falls back to the natural minor 6th/7th. Direction is judged
+by comparing the just-pressed button's index to the PREVIOUS note's
+button index (higher index = ascending). `last_degree_index` remembers
+that previous index and is deliberately reset to None -- "no direction
+yet, assume ascending" -- on every edit that changes what a button index
+even means: key, octave, mode, or preset switch. Skipping that reset
+would let a melodic line's direction leak across an edit that changed
+the scale underneath it.
+
 SERIAL PROTOCOL
 ---------------
 Every state change prints one line: '#' + JSON. While the looper runs, a
 heartbeat line goes out every JSON_LOOP_INTERVAL_MS as well, so the
 website can animate loop position. The website reads only lines starting
 with '#'; anything else is human debug output. DEBUG = False silences it.
+
+JSON fields: preset, octave, key, sample, mode, volume, cutoff, keys[8],
+loop, loop_pos. `mode` is new as of this revision -- a visualizer reading
+this feed for the first time should treat its absence as "Major".
 """
 
 import gc
@@ -102,20 +127,54 @@ TIMING = False    # per-section worst-case timing report (see MAIN LOOP)
 # So it goes first, while the heap is still one clean block. Everything
 # below is small and fits in whatever is left.
 
-SAMPLE_RATE = 11025
+SAMPLE_RATE = 16000
 BUF_SAMPLES = const(256)
+
+# Raised from 11025 -> 16000 Hz (Aug 2026 audio-quality pass). Nyquist
+# goes from 5512 Hz to 8000 Hz, which matters because the harmonic
+# instrument recipes below (Organ, Trumpet, Strings, etc.) stack partials
+# up to the 10th harmonic -- at the OLD rate, a played note's high
+# partials routinely exceeded Nyquist and aliased into audible garbage,
+# permanently baked into the wavetable at build time.
+#
+# KNOWN REMAINING LIMITATION: at mid-range play (around the default
+# preset octave and below) every recipe is comfortably safe under the
+# new Nyquist -- checked numerically, huge margin. Aliasing can still
+# occur in roughly the TOP 1-2 octaves of the playable range (closer to
+# MAX_OCTAVE=6) on the richest recipes (Organ, Trumpet, Clarinet,
+# Strings). Deliberately NOT band-limited per-instrument or per-note --
+# that would need either a dynamic per-pitch table rebuild (a real
+# architecture change) or a conservative static trim of the highest
+# partials, and the time was spent on the interpolation fix in
+# render_voice() instead, which is the larger contributor to the
+# reported bad sound quality. Worth a bench-test check at the top of the
+# range if time allows before Sunday.
+#
+# Cost: block period is BUF_SAMPLES / SAMPLE_RATE, so raising the rate
+# SHRINKS the audio timing budget -- from ~23.2 ms/block at 11025 Hz
+# down to 16.0 ms/block here. The full OLED redraw (~25 ms even at
+# 400 kHz I2C) was ALREADY close to the old budget in the worst case;
+# at 16 ms it would overrun by a wider margin every time it fires. See
+# OLED_MIN_INTERVAL_MS and the redraw-cost note near the display code
+# for how that got addressed in the same pass -- raising the sample
+# rate without also touching that would trade one audible click (tone
+# aliasing) for a worse one (buffer underrun).
 
 # Size the I2S buffer for double/triple buffering, NOT for a big safety
 # margin -- every extra block of ibuf is another block of latency between
-# a keypress and the sound. 3 blocks = ~70 ms queued. Drop to 2 for less
-# latency if the timing harness shows headroom; raise to 4 if you hear
-# clicks. This is the single most important number in the file.
+# a keypress and the sound. 3 blocks at 16000 Hz = 48 ms queued (was
+# 70 ms at 11025 Hz -- the rate change is a latency win here even before
+# counting the tone-quality fix). Drop to 2 for less latency if the
+# timing harness shows headroom; raise to 4 if you hear clicks. This is
+# the single most important number in the file.
 IBUF_BLOCKS = 3
 
-# Two int16 buffers (base take + overdub layer) at 22,050 bytes per
-# second each: 4 s costs 172 KB. The Looper backs off in half-second
-# steps if that will not fit, so a tight board gets a shorter loop rather
-# than a traceback. The startup banner prints what it actually got.
+# Two int16 buffers (base take + overdub layer) at 32,000 bytes per
+# second each at the new rate: 4 s costs 250 KB (was 172 KB at
+# 11025 Hz). The Looper backs off in half-second steps if that will not
+# fit, so a tight board gets a shorter loop rather than a traceback. The
+# startup banner prints what it actually got. Worth checking that banner
+# after this rate change -- the auto-shrink margin is smaller now.
 LOOP_SECONDS = 4
 
 looper = loop.Looper(SAMPLE_RATE, BUF_SAMPLES, seconds=LOOP_SECONDS)
@@ -186,9 +245,65 @@ CHROMATIC_SCALE = (
 MIN_OCTAVE = 2
 MAX_OCTAVE = 6
 
-# Semitone offsets of a major scale including the octave on top, so the
-# 8 buttons play root-to-root (e.g. C4..C5).
-MAJOR_SCALE_STEPS = (0, 2, 4, 5, 7, 9, 11, 12)
+# Semitone offsets, including the octave on top, so the 8 buttons play
+# root-to-root (e.g. C4..C5). Tuple values, not lists -- these are read
+# constantly and never mutated.
+#
+# The 7 diatonic modes (Ionian..Locrian) plus harmonic minor. Each is a
+# fixed rotation/alteration of the same 8-degree shape.
+MODE_STEPS = {
+    "Major":          (0, 2, 4, 5, 7, 9, 11, 12),   # Ionian
+    "Dorian":         (0, 2, 3, 5, 7, 9, 10, 12),
+    "Phrygian":       (0, 1, 3, 5, 7, 8, 10, 12),
+    "Lydian":         (0, 2, 4, 6, 7, 9, 11, 12),
+    "Mixolydian":     (0, 2, 4, 5, 7, 9, 10, 12),
+    "Natural Minor":  (0, 2, 3, 5, 7, 8, 10, 12),   # Aeolian
+    "Locrian":        (0, 1, 3, 5, 6, 8, 10, 12),
+    "Harmonic Minor": (0, 2, 3, 5, 7, 8, 11, 12),
+}
+
+# Real melodic minor is not one fixed scale -- the 6th and 7th degrees
+# depend on melodic direction:
+#   ascending:  raised 6th & 7th (strong leading tone into the octave)
+#   descending: natural 6th & 7th (same as natural minor)
+# Handled separately from MODE_STEPS for that reason; see
+# scale_step_for_degree() and the MELODIC MINOR note in the module
+# docstring.
+MELODIC_MINOR_ASCENDING_STEPS = (0, 2, 3, 5, 7, 9, 11, 12)
+MELODIC_MINOR_DESCENDING_STEPS = MODE_STEPS["Natural Minor"]
+
+# Cycling order for keypad key '6'. Tuple, not a dict -- MicroPython
+# does not preserve dict insertion order, and deriving cycle order from
+# one would scramble it and make the mode key unrehearsable on stage.
+MODE_LIST = (
+    "Major",
+    "Natural Minor",
+    "Melodic Minor",
+    "Harmonic Minor",
+    "Dorian",
+    "Phrygian",
+    "Lydian",
+    "Mixolydian",
+    "Locrian",
+)
+
+# OLED labels ARE shown (see displayState()'s "Mode: " prefix), but the
+# mode VALUE still needs to be short: "Mode: Harmonic Minor" is 160px,
+# wider than the 128px screen, so the full mode name literally cannot
+# render even with the whole row to itself. 8 chars is the practical
+# ceiling for the value at 8px-wide default font, once "Mode: " (6 chars)
+# is accounted for.
+MODE_DISPLAY_LABEL = {
+    "Major":          "Major",
+    "Natural Minor":  "NatMin",
+    "Melodic Minor":  "MelMin",
+    "Harmonic Minor": "HarMin",
+    "Dorian":         "Dorian",
+    "Phrygian":       "Phryg",
+    "Lydian":         "Lydian",
+    "Mixolydian":     "Mixo",
+    "Locrian":        "Locr",
+}
 
 
 def shift_key(current_key, step):
@@ -203,18 +318,42 @@ def shift_octave(current_octave, step):
     return max(MIN_OCTAVE, min(MAX_OCTAVE, current_octave + step))
 
 
-def build_scale_freqs(key, octave):
-    """8 frequencies (Hz), one per note button, forming a major scale
-    from `key` in `octave`. Equal temperament, A4 = 440 Hz."""
+def shift_mode(current_mode, step):
+    """Step through MODE_LIST, wrapping. `step` is always +-1 from the
+    keypad today, but this takes a step count (not just "next") to
+    match shift_key/shift_octave/shift_sample's shape."""
+    idx = MODE_LIST.index(current_mode)
+    return MODE_LIST[(idx + step) % len(MODE_LIST)]
+
+
+def scale_step_for_degree(mode, degree_index, ascending):
+    """Which semitone step to use for one button/degree (0-7),
+    accounting for melodic minor's direction-dependent 6th/7th."""
+    if mode == "Melodic Minor":
+        return (MELODIC_MINOR_ASCENDING_STEPS if ascending
+                else MELODIC_MINOR_DESCENDING_STEPS)[degree_index]
+    return MODE_STEPS.get(mode, MODE_STEPS["Major"])[degree_index]
+
+
+def build_scale_freqs(key, octave, mode, degree_index, ascending):
+    """One frequency (Hz) for a single note button, in `key`/`octave`,
+    using `mode` (direction-aware for Melodic Minor via `ascending`).
+    Equal temperament, A4 = 440 Hz.
+
+    Takes ONE degree, not all 8 -- unlike the old build_scale_freqs,
+    which always built and returned a fresh 8-element list regardless
+    of how many buttons actually changed. Melodic Minor needs a
+    per-note ascending/descending direction that can differ button to
+    button within the same keypress batch, so the note-on loop now
+    calls this once per newly-pressed button instead of computing the
+    whole scale up front."""
     root_idx = CHROMATIC_SCALE.index(key)
-    freqs = []
-    for step in MAJOR_SCALE_STEPS:
-        total = root_idx + step
-        note_octave = octave + total // 12
-        note_idx = total % 12
-        semitones_from_a4 = (note_octave - 4) * 12 + (note_idx - 9)
-        freqs.append(440.0 * (2 ** (semitones_from_a4 / 12)))
-    return freqs
+    step = scale_step_for_degree(mode, degree_index, ascending)
+    total = root_idx + step
+    note_octave = octave + total // 12
+    note_idx = total % 12
+    semitones_from_a4 = (note_octave - 4) * 12 + (note_idx - 9)
+    return 440.0 * (2 ** (semitones_from_a4 / 12))
 
 
 # ============================================================
@@ -330,8 +469,8 @@ STRINGS_P = ((1, 1.00), (2, 0.72), (3, 0.50), (4, 0.35),
 # One ordered tuple defines the name, the waveform, the ADSR envelope,
 # AND the cycling order for the keypad. Tuple, not a dict, because
 # MicroPython does not preserve dict insertion order -- deriving the
-# cycle order from a dict would scramble it and make the '3'/'6' keys
-# unrehearsable on stage.
+# cycle order from a dict would scramble it and make the '*'/'7' sample
+# keys unrehearsable on stage.
 #
 # Envelope = (attack_ms, decay_ms, sustain_level, release_ms)
 
@@ -361,19 +500,179 @@ INSTRUMENTS = (
 
 WAVETABLES = {name: make_table(fn) for name, fn, _ in INSTRUMENTS}
 ENVELOPES = {name: env for name, _, env in INSTRUMENTS}
-SAMPLE_LIST = tuple(name for name, _, _ in INSTRUMENTS)
+
+# "Drums" (not "Drum Kit") deliberately -- checked against the OLED's
+# "Sample: <name>" row, which is already at its exact 128px limit for
+# the longest existing instrument names (Sawtooth/Triangle/Clarinet, all
+# 8 chars). "Drums" (5 chars) keeps margin instead of adding a second
+# zero-margin case; "Drum Kit" would have landed at the same 128px limit
+# as those three.
+DRUM_KIT_NAME = "Drums"
+
+SAMPLE_LIST = tuple(name for name, _, _ in INSTRUMENTS) + (DRUM_KIT_NAME,)
 
 
 def shift_sample(current_sample, step):
-    """Step through SAMPLE_LIST, wrapping."""
+    """Step through SAMPLE_LIST, wrapping. Includes "Drums" -- cycling
+    the sample key with '*'/'7' reaches the drum kit exactly like any
+    other instrument. What's DIFFERENT about drums happens entirely at
+    the note-on dispatch site in the main loop (see DRUM KIT below),
+    not here."""
     idx = SAMPLE_LIST.index(current_sample)
     return SAMPLE_LIST[(idx + step) % len(SAMPLE_LIST)]
 
 
 # ============================================================
+# DRUM KIT  (one-shot sample playback -- Aug 2026 audio pass)
+# ============================================================
+# Structurally different from every instrument above: those are TUNED,
+# LOOPING wavetables -- one short cycle (TABLE_LEN samples) repeated at
+# a pitch-dependent rate, sustained for as long as the button is held
+# (Voice's ADSR has a SUSTAIN stage that holds indefinitely). A drum hit
+# is a one-shot: a long (thousands of samples), non-looping recording
+# that plays exactly once front-to-back and stops itself when the
+# sample data runs out, whether or not the button is still down. There
+# is no sustain stage and no meaningful "pitch" to assign per scale
+# degree.
+#
+# Trying to force one-shot playback through Voice's phase/TABLE_LEN-wrap
+# machinery would mean either abusing phase_inc=1.0 with a per-voice
+# TABLE_LEN (breaking the global TABLE_LEN constant render_voice already
+# hardcodes) or adding branches to render_voice's per-sample hot loop for
+# a case that does not apply to the other 14 instruments. Cheaper and
+# clearer to give drums their own voice type (DrumVoice) and render
+# function (render_drum_voice), mixed into the same mix_buf.
+#
+# Per your call: button 1=Kick, 2=Snare, 3=Hat Closed, 4=Hat Open,
+# 5=Clap, 6=Tom Low, 7=Tom Mid, 8=Crash -- FIXED regardless of the
+# preset's key/octave/mode. Selecting "Drums" as the sample bypasses
+# build_scale_freqs() entirely for note-on; see the main loop's note
+# button section.
+#
+# Samples are PRECOMPUTED offline (generate_drums.py, not shipped to the
+# Pico) and loaded here as flat .wav files -- not synthesized live at
+# boot. Generating ~30,000 samples of noise/sine-sweep DSP in interpreted
+# MicroPython was estimated at 1.5-6+ seconds of boot time depending on
+# optimization; a slow, unpredictable boot is a real risk if the board
+# ever needs a reset mid-performance. Loading precomputed files is
+# effectively instant by comparison.
+
+DRUM_FILES = (
+    "kick.wav", "snare.wav", "hat_closed.wav", "hat_open.wav",
+    "clap.wav", "tom_low.wav", "tom_mid.wav", "crash.wav",
+)
+
+
+def _load_wav_samples(path):
+    """Read a 16-bit mono PCM .wav file's sample data into an array('h').
+
+    Skips the RIFF/fmt header by finding the 'data' chunk rather than
+    hardcoding a 44-byte offset -- the files as generated have no extra
+    chunks so 44 would work today, but trusting the header's own chunk
+    size is one extra line and survives a future regeneration that adds
+    metadata chunks.
+
+    Raises (loudly, at boot, not mid-performance) if a file is missing or
+    malformed -- same philosophy as the Looper's allocation: fail loud
+    and early rather than silently play garbage or silence on stage."""
+    with open(path, "rb") as f:
+        header = f.read(12)
+        if header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+            raise RuntimeError(path + ": not a RIFF/WAVE file")
+
+        # Walk chunks until 'data' is found.
+        while True:
+            chunk_id = f.read(4)
+            if len(chunk_id) < 4:
+                raise RuntimeError(path + ": no data chunk found")
+            chunk_size = int.from_bytes(f.read(4), "little")
+            if chunk_id == b"data":
+                raw = f.read(chunk_size)
+                break
+            f.read(chunk_size)   # skip this chunk (e.g. 'fmt ')
+
+    samples = array("h", raw)
+    if len(samples) * 2 != len(raw):
+        raise RuntimeError(path + ": data chunk size not a multiple of 2 bytes")
+    return samples
+
+
+# DRUM_KIT_DIR: where the .wav files live on the Pico's flash filesystem,
+# alongside main.py/loop.py/ssd1306.py. Loaded AFTER the Looper (see the
+# AUDIO CONSTANTS + LOOPER section at the top of this file) for the same
+# reason WAVETABLES is built after it -- the Looper's ~250 KB allocation
+# needs the heap to still be one clean block, and drum samples, while
+# individually small, are still real allocations that should happen once
+# the big one is safely done.
+DRUM_KIT_DIR = "drums/"
+
+DRUM_SAMPLES = tuple(_load_wav_samples(DRUM_KIT_DIR + fname)
+                      for fname in DRUM_FILES)
+
+
+class DrumVoice:
+    """One-shot sample playback: no phase-wrap, no ADSR sustain. Plays
+    `sample` forward from `pos` until pos reaches the end, then goes
+    idle on its own -- unlike Voice, note_off() does nothing, because a
+    real drum hit is not "held," it just plays out. __slots__ for the
+    same reason as Voice: no per-instance dict, no GC pressure from dict
+    growth mid-performance."""
+    __slots__ = ("active", "sample", "pos")
+
+    def __init__(self):
+        self.active = False
+        self.sample = None
+        self.pos = 0
+
+    def note_on(self, drum_index):
+        """drum_index is the BUTTON index (0-7), used directly as the
+        DRUM_SAMPLES index -- fixed mapping, no scale/key/octave
+        involved. Re-triggering a still-sounding drum (fast repeated
+        hits) restarts it from 0 rather than layering a second copy --
+        simpler and avoids needing a drum-specific polyphony scheme on
+        top of the existing one-voice-per-button design."""
+        self.sample = DRUM_SAMPLES[drum_index]
+        self.pos = 0
+        self.active = True
+
+    def note_off(self):
+        # Deliberately a no-op: a drum one-shot plays out regardless of
+        # how long the button is held. Present so the main loop's
+        # existing "if pressed: note_on() elif released: note_off()"
+        # shape doesn't need a drum-specific special case there.
+        pass
+
+
+drum_voices = [DrumVoice() for _ in range(NUM_VOICES)]
+
+
+@micropython.native
+def render_drum_voice(v, mix_buf, n_samples):
+    """Mix one drum voice's contribution into mix_buf. Structurally
+    simpler than render_voice: no phase accumulator, no envelope, no
+    interpolation (these are already-recorded samples at the project's
+    own SAMPLE_RATE, not a pitched lookup table being stepped through at
+    an arbitrary rate -- there is nothing to interpolate between). Just
+    copy forward from pos, clamping at the sample's own length."""
+    sample = v.sample
+    pos = v.pos
+    sample_len = len(sample)
+
+    n = 0
+    while n < n_samples and pos < sample_len:
+        mix_buf[n] += sample[pos]
+        pos += 1
+        n += 1
+
+    v.pos = pos
+    if pos >= sample_len:
+        v.active = False
+
+
+# ============================================================
 # PRESETS + REPORTED STATE
 # ============================================================
-# A preset stores only what the keypad edits: octave, key, wave.
+# A preset stores only what the keypad edits: octave, key, sample, mode.
 #
 # It deliberately does NOT store volume or cutoff. Those are physical
 # pots, and no preset can move a knob -- recalling a stored volume that
@@ -383,10 +682,20 @@ def shift_sample(current_sample, step):
 # `presets[active_preset]` is the single source of truth for pitch and
 # timbre. `state` is a flat mirror of everything, rebuilt by sync_state()
 # purely so the OLED and the website have one object to read.
+#
+# PRESET_FIELDS lists every key a preset owns. sync_state() below loops
+# over this instead of one hand-written line per field, specifically so
+# that adding a field to a preset (like `mode` was just added) cannot
+# silently forget to add the matching sync line -- that failure mode is
+# invisible in testing (the preset itself is still correct) and only
+# shows up on stage as "I changed it but the website/OLED didn't
+# update."
+
+PRESET_FIELDS = ("octave", "key", "sample", "mode")
 
 presets = [
-    {"octave": 4, "key": "C", "sample": "Sine"},
-    {"octave": 5, "key": "F", "sample": "Sawtooth"},
+    {"octave": 4, "key": "C", "sample": "Sine", "mode": "Major"},
+    {"octave": 5, "key": "F", "sample": "Sawtooth", "mode": "Major"},
 ]
 
 active_preset = 0
@@ -396,6 +705,7 @@ state = {
     "octave": 4,
     "key": "C",
     "sample": "Sine",
+    "mode": "Major",
     "volume": 75,
     "cutoff": 100,          # 100 = filter fully open (bypassed)
     "keys": [False] * 8,
@@ -405,14 +715,16 @@ state = {
 
 
 def sync_state():
-    """Copy the active preset into the reported state. Called once per
-    update rather than at every edit site, so there is no way for the
-    mirror to drift out of step with the preset behind it."""
+    """Copy every preset-owned field (PRESET_FIELDS) into the reported
+    state. Called once per update rather than at every edit site, so
+    there is no way for the mirror to drift out of step with the preset
+    behind it -- and looping over PRESET_FIELDS instead of listing each
+    field by hand means a future field addition can't be forgotten
+    here."""
     p = presets[active_preset]
     state["preset"] = active_preset + 1
-    state["octave"] = p["octave"]
-    state["key"] = p["key"]
-    state["sample"] = p["sample"]
+    for field in PRESET_FIELDS:
+        state[field] = p[field]
 
 
 # ============================================================
@@ -428,6 +740,14 @@ buttons = [Pin(p, Pin.IN, Pin.PULL_UP) for p in BUTTON_PINS]
 # are written in place and never reallocated.
 key_bits = bytearray(8)
 prev_key_bits = bytearray(8)
+
+# Which button index (0-7) was most recently note-on'd, for Melodic
+# Minor's ascending/descending 6th & 7th (see MELODIC MINOR in the
+# module docstring). None means "no direction yet" -- treated as
+# ascending. Reset to None on any edit that changes what a button index
+# means: key, octave, mode, or preset switch, so a melodic line's
+# direction can't leak across an edit that changed the scale under it.
+last_degree_index = None
 
 
 # ============================================================
@@ -494,38 +814,158 @@ def read_pot(ch):
 
 # freq set explicitly: a full 1 KB frame at the 100 kHz default takes
 # ~100 ms, which would blow the entire audio block budget on its own. At
-# 400 kHz it is ~25 ms -- still the most expensive thing in the loop,
-# which is why the full redraw is rate-limited.
+# 400 kHz a full display.show() is still ~23-25 ms of raw I2C transfer
+# time -- more than the ENTIRE 16 ms block budget at the current
+# SAMPLE_RATE (see the SAMPLE_RATE comment for that history). A full
+# redraw was already tight at the old 23.2 ms budget; at 16 ms it would
+# overrun by close to its own length every time it fired. Fixed below by
+# never calling display.show() from displayState() at all -- see
+# PAGE_HEIGHT / _push_page.
 i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=400000)
 display = ssd1306.SSD1306_I2C(128, 64, i2c)
 
-OLED_MIN_INTERVAL_MS = 200   # full redraw (~25 ms each)
+OLED_MIN_INTERVAL_MS = 100   # partial redraw is cheap now; can run more often
 BAR_INTERVAL_MS = 50         # loop progress bar, one page only (~3 ms)
+
+# SSD1306 command bytes for addressing a single 8px-tall "page" (row),
+# same technique loop.py already uses for the progress bar -- see
+# Looper.update_bar(). Duplicated here rather than imported from loop.py
+# because it is a display-driver detail, not a looper detail; the two
+# modules happen to both need it.
+_SET_COL_ADDR = 0x21
+_SET_PAGE_ADDR = 0x22
+PAGE_HEIGHT = const(8)
+
+
+def _push_page(page):
+    """Write ONE 128-byte page from display.buffer to the OLED, instead
+    of display.show()'s full 1024-byte frame. ~1/8th the I2C traffic,
+    which is the difference between overrunning the audio block budget
+    and not. Mirrors loop.py's update_bar() exactly, generalized to any
+    page 0-7 instead of hardcoding page 7."""
+    display.write_cmd(_SET_COL_ADDR)
+    display.write_cmd(0)
+    display.write_cmd(127)
+    display.write_cmd(_SET_PAGE_ADDR)
+    display.write_cmd(page)
+    display.write_cmd(page)
+    display.write_data(display.buffer[page * 128:(page + 1) * 128])
+
+
+# Last-drawn content string per page, keyed by page number. displayState()
+# skips redrawing/pushing a page whose content matches what is already on
+# screen. None (not "") for every entry so the very FIRST call always
+# treats every page as changed and does a full initial paint -- an empty
+# string would look identical to a page that hasn't been drawn yet if any
+# real content ever manages to be genuinely empty, but None can never
+# collide with a str.
+_page_last = {0: None, 1: None, 2: None, 3: None, 5: None}
 
 
 def displayState(st):
-    """Full-frame redraw of everything except the bottom page.
+    """Partial, CHANGE-DETECTED redraw: draws into display.buffer exactly
+    like a full redraw would, but pushes only the pages whose CONTENT
+    actually changed since the last call, as individual 128-byte page
+    writes. Never display.show(), which would push all 1024 bytes
+    including blank/unused pages and the looper's progress bar page
+    every single time.
 
-    Rows 56-63 belong to the looper's progress bar, which is pushed
-    separately and far more often. Clearing only the top 56 rows means a
-    full redraw leaves the bar intact instead of blanking it until the
-    next bar tick."""
-    display.fill_rect(0, 0, 128, 56, 0)
+    Why change-detection and not just "always push all 5 text pages":
+    pushing every text page unconditionally still costs ~15 ms of raw
+    I2C transfer (5 pages x ~134 bytes x 9 bits / 400 kHz), against a
+    16 ms block budget -- under 1 ms of margin, too tight to trust. The
+    common case (only the volume pot moved, say) only needs ONE page
+    repainted, not five, so tracking each row's last-drawn string and
+    skipping unchanged ones keeps the typical call cheap even though the
+    worst case (everything changed at once, e.g. a preset switch) still
+    costs close to the full ~15 ms.
 
-    display.text("P" + str(st["preset"]) + " Key:" + st["key"], 0, 0)
-    display.text("Oct:" + str(st["octave"]), 80, 0)
-    display.text("Wave: " + st["sample"], 0, 8)
-    display.text("Vol: " + str(st["volume"]), 0, 16)
-    display.text("LP: " + str(st["cutoff"]), 64, 16)
+    ACCEPTED RISK: a single action that changes all 5 pages at once (the
+    preset-cycle key changes key/octave/sample/mode together) still costs
+    ~15 ms against the 16 ms budget -- tight, and a genuine overrun is
+    possible if it lands on an already-expensive block. Deliberately NOT
+    spread across multiple loop passes to avoid a pending-pages queue and
+    the extra state that would need testing time this build doesn't have.
+    Accepted because it is a single, rare, self-limiting action rather
+    than a sustained problem -- worth revisiting if bench testing shows
+    an audible click specifically on preset switch.
 
-    display.text("Keys:", 0, 24)
-    display.text("".join("1" if k else "0" for k in st["keys"]), 40, 24)
-    display.text("12345678", 40, 32)
+    Rows 56-63 (page 7) belong to the looper's progress bar, pushed
+    separately and far more often by loop.py -- never touched here.
 
+    LAYOUT  (128px wide / 16 chars per row at the default 8px font;
+    every row below MUST stay on an 8px page boundary -- y a multiple
+    of 8 -- or a partial-page push will only ever move the top half of
+    that row's text and leave the bottom half stale on screen. This is
+    why the loop-status row moved from y=44, which straddled pages 5/6,
+    to y=40, which does not.):
+
+        row 0   (page 0)  P1 Key:C          Oct:4     preset/key/octave
+        row 8   (page 1)  Sample: Sawtooth            sample name
+        row 16  (page 2)  Mode: HarMin                mode (abbreviated
+                                                        value -- see
+                                                        MODE_DISPLAY_LABEL,
+                                                        "Mode: Harmonic
+                                                        Minor" is 160px,
+                                                        wider than the
+                                                        128px screen)
+        row 24  (page 3)  Vol: 75           LP: 100   volume, cutoff
+        row 32  (page 4)  -- blank, dropped key-bitmap rows --
+        row 40  (page 5)  Loop: EMPTY                 loop status
+        row 48  (page 6)  -- blank --
+        row 56  (page 7)  -- owned by loop.py's progress bar --
+
+    Adding a new row means adding it to _PAGE_TEXT below AND to its
+    page's entry in _page_last (both near the top of the OLED section) --
+    forgetting either draws the new text correctly into the buffer but
+    never pushes it to the physical screen, which is a silent, confusing
+    bug (the OLED would just never show the new field)."""
+    page0 = "P" + str(st["preset"]) + " Key:" + st["key"]
+    page0b = "Oct:" + str(st["octave"])
+    page1 = "Sample: " + st["sample"]
+    mode_label = MODE_DISPLAY_LABEL.get(st["mode"], st["mode"])
+    page2 = "Mode: " + mode_label
+    page3 = "Vol: " + str(st["volume"])
+    page3b = "LP: " + str(st["cutoff"])
     # `looper` is defined below but always exists by the time this runs.
-    display.text("Loop: " + looper.status_text(), 0, 44)
+    page5 = "Loop: " + looper.status_text()
 
-    display.show()
+    # One combined key per page so a change in EITHER string on a shared
+    # page (e.g. Vol vs LP, both on page 3) is still detected -- comparing
+    # them separately would need two dirty-flags per page for no benefit.
+    new_content = {
+        0: page0 + "|" + page0b,
+        1: page1,
+        2: page2,
+        3: page3 + "|" + page3b,
+        5: page5,
+    }
+
+    for page, content in new_content.items():
+        if _page_last[page] == content:
+            continue   # unchanged since last call -- skip blank/draw/push entirely
+
+        display.fill_rect(0, page * PAGE_HEIGHT, 128, PAGE_HEIGHT, 0)
+
+        if page == 0:
+            display.text(page0, 0, 0)
+            display.text(page0b, 80, 0)
+        elif page == 1:
+            display.text(page1, 0, 8)
+        elif page == 2:
+            display.text(page2, 0, 16)
+        elif page == 3:
+            display.text(page3, 0, 24)
+            display.text(page3b, 64, 24)
+        elif page == 5:
+            display.text(page5, 0, 40)
+
+        _push_page(page)
+        _page_last[page] = content
+
+
+
+
 
 
 # ============================================================
@@ -653,7 +1093,10 @@ MIX_HEADROOM = 3.0
 # is arranged to avoid.
 
 CUTOFF_MIN_HZ = 60
-CUTOFF_MAX_HZ = 5000     # Nyquist is 5512 Hz at an 11025 Hz sample rate
+# Kept just under Nyquist at the CURRENT SAMPLE_RATE, same margin as
+# before (roughly 500 Hz of headroom) -- this constant must move if
+# SAMPLE_RATE moves again. At 16000 Hz, Nyquist is 8000 Hz.
+CUTOFF_MAX_HZ = 7200
 
 
 def _cutoff_k(pct):
@@ -681,7 +1124,32 @@ def render_voice(v, mix_buf, n_samples):
     """Add one voice's contribution to mix_buf, advancing its phase and
     envelope. Every per-sample value is pulled into a local first --
     self.x lookups are among the slowest operations in MicroPython and
-    this loop runs 256 times per voice per block."""
+    this loop runs 256 times per voice per block.
+
+    LINEAR INTERPOLATION (added in the Aug 2026 audio-quality pass):
+    the old code read table[int(phase)] with no interpolation --
+    nearest-neighbor / zeroth-order-hold. At the phase increments real
+    notes actually use (10-70+ table-steps per output sample across the
+    playable range -- a played note this far above the table's own
+    256-sample resolution skips large, uneven chunks of the table
+    between samples), that produces a harsh, gritty, "clicking/clacking"
+    character on EVERY note, worse at higher pitches -- this was very
+    likely the dominant contributor to the reported bad sound quality,
+    more than the sample-rate/aliasing issue fixed elsewhere in this
+    pass. Interpolating between the two nearest table samples smooths
+    that step down to what it should sound like: a clean tone at the
+    table's actual harmonic content, not extra digital noise on top of
+    it.
+
+    Cost: one extra array read, one subtract, one multiply, one add per
+    sample -- cheap next to the envelope/mix work already happening
+    here, and unlike raising SAMPLE_RATE this does not shrink the block
+    time budget at all.
+
+    idx1 wraps to 0 only in the single case idx0 == TABLE_LEN - 1 (right
+    before phase itself wraps) -- handled with one comparison rather
+    than a modulo every sample, since idx0 is already guaranteed to stay
+    in [0, TABLE_LEN) by the existing phase-wrap logic below."""
     table = v.table
     phase = v.phase
     phase_inc = v.phase_inc
@@ -694,7 +1162,13 @@ def render_voice(v, mix_buf, n_samples):
 
     n = 0
     while n < n_samples:
-        raw = table[int(phase)]
+        idx0 = int(phase)
+        idx1 = idx0 + 1
+        if idx1 >= TABLE_LEN:
+            idx1 = 0
+        frac = phase - idx0
+        s0 = table[idx0]
+        raw = s0 + (table[idx1] - s0) * frac
 
         phase += phase_inc
         if phase >= TABLE_LEN:
@@ -765,6 +1239,18 @@ def generate_block(volume_pct, cutoff_pct):
         if voice.active:
             render_voice(voice, mb, n)
 
+    # Drum one-shots mix into the SAME buffer, same signal chain
+    # position (before the filter/loop/volume passes below) -- a snare
+    # hit gets filtered and can be looped exactly like a melodic note.
+    # Independent of `voices` above: a melodic note already triggered
+    # keeps playing out on its own schedule even if the sample selector
+    # has since switched to Drums (see the DRUM KIT section for why this
+    # needs no special-case handling -- Voice.note_on already copies its
+    # table/envelope by value, so it never re-reads preset["sample"]).
+    for dv in drum_voices:
+        if dv.active:
+            render_drum_voice(dv, mb, n)
+
     # Pass 1: lowpass, in place.
     i = 0
     while i < n:
@@ -797,9 +1283,8 @@ displayState(state)
 looper.update_bar(display)
 
 print("--- Pico 2 W Music Controller | Team 13 ---")
-print("keypad: #/9 key +-  0/8 octave +-  */7 wave +-")
-print("        1 preset 1  4 preset 2")
-print("        5 rec  6 play/pause  3 undo  2 reset")
+print("keypad: #/9 key +-  0/8 octave +-  */7 sample +-  6 mode")
+print("        3 preset  5 rec  4 play/pause  1 loop reset")
 print("loop: %.2f s | %d blocks | %d KB" % (
     looper.capacity / SAMPLE_RATE,
     looper.n_blocks,
@@ -847,13 +1332,36 @@ while True:
         key_bits[i] = 1 if buttons[i].value() == 0 else 0
 
     if key_bits != prev_key_bits:
-        scale_freqs = build_scale_freqs(preset["key"], preset["octave"])
+        # Drums bypass build_scale_freqs and the melodic Voice[] array
+        # entirely -- button index IS the drum index (fixed Kick/Snare/
+        # HatClosed/HatOpen/Clap/TomLow/TomMid/Crash mapping), not a
+        # scale degree. See the DRUM KIT section for why one-shot
+        # playback needs a structurally different voice type.
+        is_drums = (preset["sample"] == DRUM_KIT_NAME)
 
+        # One frequency computed per newly-pressed button, not the whole
+        # scale up front -- Melodic Minor's ascending/descending 6th &
+        # 7th is a per-note decision (see MELODIC MINOR in the module
+        # docstring), so it cannot be precomputed for all 8 degrees
+        # before knowing which one is about to sound. Skipped entirely
+        # for drums, which have no scale degree to compute.
         for i in range(NUM_VOICES):
             if key_bits[i] and not prev_key_bits[i]:
-                voices[i].note_on(scale_freqs[i], preset["sample"])
+                if is_drums:
+                    drum_voices[i].note_on(i)
+                else:
+                    ascending = (last_degree_index is None
+                                 or i > last_degree_index)
+                    freq = build_scale_freqs(
+                        preset["key"], preset["octave"], preset["mode"],
+                        i, ascending)
+                    voices[i].note_on(freq, preset["sample"])
+                    last_degree_index = i
             elif prev_key_bits[i] and not key_bits[i]:
-                voices[i].note_off()
+                if is_drums:
+                    drum_voices[i].note_off()   # no-op; see DrumVoice
+                else:
+                    voices[i].note_off()
 
         state["keys"] = [b == 1 for b in key_bits]
         prev_key_bits[:] = key_bits
@@ -886,23 +1394,32 @@ while True:
             print("[debug] keypad:", pressed_key)
 
         # --- pitch (edits the active preset in place) ---
+        # Key and octave both change what a button INDEX means musically
+        # (build_scale_freqs maps index -> degree -> frequency using
+        # both), so either edit resets last_degree_index -- otherwise a
+        # Melodic Minor line's ascending/descending state could survive
+        # a transpose that changed what "higher" even refers to.
         if pressed_key == "#":
             preset["key"] = shift_key(preset["key"], 1)
+            last_degree_index = None
             changed = True
 
         elif pressed_key == "9":
             preset["key"] = shift_key(preset["key"], -1)
+            last_degree_index = None
             changed = True
 
         elif pressed_key == "0":
             preset["octave"] = shift_octave(preset["octave"], 1)
+            last_degree_index = None
             changed = True
 
         elif pressed_key == "8":
             preset["octave"] = shift_octave(preset["octave"], -1)
+            last_degree_index = None
             changed = True
 
-        # --- timbre ---
+        # --- timbre (does not affect scale degree math -- no reset) ---
         elif pressed_key == "*":
             preset["sample"] = shift_sample(preset["sample"], 1)
             changed = True
@@ -911,27 +1428,33 @@ while True:
             preset["sample"] = shift_sample(preset["sample"], -1)
             changed = True
 
-        # --- preset select ---
-        # Direct select, not a toggle: 1 always lands on preset 1 and 4
-        # always on preset 2, so there is never a question of which one
-        # you are on when you hit the key mid-song.
-        #
-        # Notes already sounding keep the frequency and wavetable they
-        # were triggered with -- switching preset must not retune a held
-        # chord underneath you. `preset` is rebound so anything later in
-        # this same pass edits the newly selected one.
-        elif pressed_key == "1":
-            active_preset = 0
-            preset = presets[0]
+        # --- mode ---
+        # Changes the step table build_scale_freqs uses for every
+        # degree, so it resets direction state for the same reason
+        # key/octave do above.
+        elif pressed_key == "6":
+            preset["mode"] = shift_mode(preset["mode"], 1)
+            last_degree_index = None
             changed = True
 
-        elif pressed_key == "4":
-            active_preset = 1
-            preset = presets[1]
+        # --- preset select ---
+        # CYCLES (2 presets today), not direct-select -- unlike the old
+        # 1/4 scheme, a single key can't land on a specific preset by
+        # index once there could be more than 2. Notes already sounding
+        # keep the frequency and wavetable they were triggered with --
+        # switching preset must not retune a held chord underneath you.
+        # `preset` is rebound so anything later in this same pass edits
+        # the newly selected one. Switching presets can change key,
+        # octave, AND mode all at once, so this resets direction state
+        # too.
+        elif pressed_key == "3":
+            active_preset = (active_preset + 1) % len(presets)
+            preset = presets[active_preset]
+            last_degree_index = None
             changed = True
 
         # --- loop transport ---
-        elif pressed_key == "6":
+        elif pressed_key == "4":
             looper.play_toggle()
             changed = True
 
@@ -939,11 +1462,7 @@ while True:
             looper.record_toggle()
             changed = True
 
-        elif pressed_key == "3":
-            looper.undo_toggle()
-            changed = True
-
-        elif pressed_key == "2":
+        elif pressed_key == "1":
             looper.reset()
             changed = True
 
@@ -983,13 +1502,24 @@ while True:
         t4 = time.ticks_us()
 
     # --- audio: must run every pass, unconditionally -------------------
-    # Silence fast path: skip the clear, the 8 idle voice checks, and the
-    # filter/loop/scale/clip passes entirely.
+    # Silence fast path: skip the clear, the voice/drum idle checks, and
+    # the filter/loop/scale/clip passes entirely.
     any_active = False
     for voice in voices:
         if voice.active:
             any_active = True
             break
+    if not any_active:
+        # A drum one-shot can be the ONLY thing sounding (no melodic
+        # buttons held), so this must be checked independently -- an
+        # earlier version of this check only scanned `voices` and would
+        # have written silence_buf straight over an active drum hit,
+        # making every drum sound completely silent whenever no melodic
+        # note happened to be held at the same time.
+        for dv in drum_voices:
+            if dv.active:
+                any_active = True
+                break
 
     # Three reasons the output may be non-zero with no key held:
     #   - the looper is playing back or recording
