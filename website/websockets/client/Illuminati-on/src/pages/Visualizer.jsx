@@ -59,8 +59,15 @@ export default function Visualizer() {
       ws.onerror = () => ws.close()
 
       ws.onmessage = (event) => {
+        // Belt-and-braces: the bridge already strips the Pico's '#' marker
+        // and drops debug prints, but a raw passthrough would otherwise
+        // throw on every single message and freeze the dashboard while the
+        // connection dot stayed green.
+        const raw = String(event.data).trim().replace(/^#/, "").trim()
+        if (!raw.startsWith("{")) return
+
         try {
-          const data = JSON.parse(event.data)
+          const data = JSON.parse(raw)
 
           if (Array.isArray(data.keys)) {
             const prev = prevKeysRef.current
@@ -89,7 +96,7 @@ export default function Visualizer() {
             cutoff: data.cutoff ?? prev.cutoff,
             loop: data.loop ?? prev.loop,
             loop_pos: data.loop_pos ?? prev.loop_pos,
-            mode: data.mode ?? "Major",
+            mode: data.mode ?? prev.mode,
           }))
         } catch (err) {
           console.error("Invalid JSON:", err)
