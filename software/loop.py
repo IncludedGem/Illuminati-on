@@ -35,10 +35,10 @@ accumulate.
 
 MEMORY
 ------
-Mono int16 at 16000 Hz costs 32,000 bytes per second, and there are TWO
+Mono int16 at 12000 Hz costs 24,000 bytes per second, and there are TWO
 buffers:
 
-    2 s -> 125 KB      3 s -> 188 KB      4 s -> 250 KB
+    2 s -> 94 KB       3 s -> 141 KB      4 s -> 188 KB
 
 Allocation needs 3x that figure momentarily unless _alloc_pair's
 drop-the-temporary path is preserved -- see the comment there before
@@ -50,9 +50,9 @@ a large chunk of it. Run gc.mem_free() on YOUR board before raising
 `seconds`; the constructor backs off in half-second steps and the
 startup banner prints what it actually got.
 
-Length is quantised to whole audio blocks (16 ms at 256 samples /
-16000 Hz). That lets playback do its wrap check once per block instead
-of once per sample, and 16 ms is well below what reads as a timing
+Length is quantised to whole audio blocks (21.3 ms at 256 samples /
+12000 Hz). That lets playback do its wrap check once per block instead
+of once per sample, and 21 ms is well below what reads as a timing
 error.
 
 STATE MACHINE

@@ -19,6 +19,33 @@ from micropython import const
 TABLE_LEN = const(256)
 TABLE_AMP = 32000
 
+# ============================================================
+# BAND LIMIT
+# ============================================================
+# A wavetable is sampled once at build time and then played back at
+# whatever rate the note needs, so any partial above Nyquist is folded
+# down into the audible band PERMANENTLY, at table-build time. No
+# lowpass downstream can remove it -- by the time it is in the table the
+# alias is already below Nyquist and looks like signal.
+#
+# Nyquist at SAMPLE_RATE = 12000 is 6000 Hz. The highest partial that
+# survives depends on the note being played, so a single shared table
+# has to be sized for a DESIGN PITCH:
+#
+#     octave 4 top (C5, 523 Hz)   -> 11 harmonics fit
+#     octave 5 top (C6, 1046 Hz)  ->  5 harmonics fit
+#     octave 6 top (C7, 2093 Hz)  ->  2 harmonics fit
+#
+# N_MAX = 5 sizes the tables for the top of octave 5, which is the top of
+# the range anything is actually played in. KNOWN AND ACCEPTED: the
+# octave 6 register still folds. Sizing for it instead would mean two
+# harmonics total, which does not sound like a sawtooth, a trumpet, or
+# anything else -- it reduces every instrument in the kit to a near-sine
+# in order to protect a register nobody plays in. The real fix is
+# per-pitch mip-mapped tables, which is a rebuild-on-note-on cost this
+# project has no budget for.
+N_MAX = 5
+
 
 def make_table(fn):
     """Sample one cycle of fn(t), t in [0,1), into a signed 16-bit table."""
@@ -29,11 +56,21 @@ def make_table(fn):
 def harmonic(partials, norm=None):
     """Build a waveform function from (harmonic multiple, amplitude) pairs.
 
-    norm defaults to the sum of the amplitudes -- the worst case peak of
-    the sum, which guarantees |output| <= 1 so the table can never clip.
+    Partials above N_MAX are DROPPED HERE, once, so every recipe below
+    can be written out in full at its musically correct spectrum and
+    still come out band-limited. Keeping the drop in one place means the
+    band limit is a single constant to re-tune if SAMPLE_RATE moves
+    again, rather than a hand-edit of a dozen tuples.
+
+    norm defaults to the sum of the amplitudes THAT SURVIVED the band
+    limit -- the worst case peak of the sum, which guarantees
+    |output| <= 1 so the table can never clip. Normalising against the
+    full untrimmed sum instead would leave every trimmed instrument
+    quieter than it should be, by exactly the amount that was trimmed.
     Real peaks are lower (the partials don't all crest together), so this
     is conservative, which is what we want with 8 voices mixing.
     """
+    partials = tuple((m, a) for m, a in partials if m <= N_MAX)
     if norm is None:
         norm = sum(amp for _, amp in partials)
     two_pi = 2 * math.pi
@@ -47,22 +84,39 @@ def harmonic(partials, norm=None):
     return fn
 
 
-# --- Non-harmonic (geometric) waveforms ---
+# --- Geometric waveforms, built ADDITIVELY so they band-limit ---
+#
+# Sampling an ideal square or sawtooth shape directly puts a step
+# discontinuity in the table, and a step contains every harmonic up to
+# the 128th. At 12000 Hz nearly all of them are above Nyquist and fold
+# back down as inharmonic noise -- which is what made Sawtooth (the
+# default sample on preset 2) the harshest voice in the kit.
+#
+# Building the same waveforms from their Fourier series instead means
+# harmonic() applies N_MAX to them exactly like any modelled instrument.
+# The result is a rounded-off square and saw ("Gibbs ears"), which is
+# what a band-limited version of these waveforms legitimately looks like
+# -- and it is what analogue synths with real filters sound like anyway.
 
-def square_fn(t):
-    return 1.0 if t < 0.5 else -1.0
+# Sawtooth: all harmonics, amplitude 1/n.
+SAW_P = tuple((n, 1.0 / n) for n in range(1, N_MAX + 1))
 
+# Square: ODD harmonics only, amplitude 1/n. The missing even harmonics
+# are why a square is hollow where a saw is bright.
+SQUARE_P = tuple((n, 1.0 / n) for n in range(1, N_MAX + 1, 2))
 
-def saw_fn(t):
-    return 2.0 * t - 1.0
+# 25% pulse: amplitude of harmonic n goes as |sin(n*pi*d)|/n for duty d.
+# At d = 1/4 every 4th harmonic vanishes -- the same nodal argument as
+# the plucked-string recipes below.
+PULSE25_P = tuple((n, abs(math.sin(n * math.pi * 0.25)) / n)
+                  for n in range(1, N_MAX + 1))
 
-
+# Triangle keeps its direct geometric form. Its harmonics roll off as
+# 1/n^2 rather than 1/n, so by the 9th they are already 40 dB down and
+# whatever folds is far below the noise floor. Sampling the shape
+# directly is cheaper and sounds identical.
 def triangle_fn(t):
     return 4.0 * abs(t - 0.5) - 1.0
-
-
-def pulse25_fn(t):
-    return 1.0 if t < 0.25 else -1.0
 
 
 # --- Harmonic recipes: (harmonic multiple, amplitude) ---
@@ -133,19 +187,23 @@ STRINGS_P = ((1, 1.00), (2, 0.72), (3, 0.50), (4, 0.35),
 INSTRUMENTS = (
     # --- synth waveforms ---
     ("Sine",     harmonic(((1, 1.0),)),  (10,  80, 0.85, 150)),
-    ("Square",   square_fn,              (5,   60, 0.80, 100)),
-    ("Sawtooth", saw_fn,                 (15, 120, 0.75, 200)),
+    ("Square",   harmonic(SQUARE_P),     (5,   60, 0.80, 100)),
+    ("Sawtooth", harmonic(SAW_P),        (15, 120, 0.75, 200)),
     ("Triangle", triangle_fn,            (10, 100, 0.85, 180)),
-    ("Pulse",    pulse25_fn,             (5,   60, 0.75, 120)),
+    ("Pulse",    harmonic(PULSE25_P),    (5,   60, 0.75, 120)),
 
     # --- modelled instruments ---
     ("Organ",    harmonic(ORGAN_P),      (12,  40, 0.97, 400)),
     ("Bell",     harmonic(BELL_P),       (1,  400, 0.22, 1900)),
     ("Pluck",    harmonic(PLUCK_P),      (2,  200, 0.09, 90)),
-    # norm=3.15 is deliberate, not the 2.56 amplitude sum -- piano was
-    # hand-trimmed down because its inharmonic partials beat against
-    # each other and read as louder than the sum predicts.
-    ("Piano",    harmonic(PIANO_P, 3.15), (2, 450, 0.12, 450)),
+    # norm is deliberately ABOVE the amplitude sum -- piano was hand
+    # trimmed down because its inharmonic partials beat against each
+    # other and read as louder than the sum predicts. The original pair
+    # was 3.15 against an untrimmed sum of 2.56, a factor of 1.23; N_MAX
+    # leaves a surviving sum of 2.40, so the same factor gives 2.95.
+    # Keeping the literal 3.15 would have quietly dropped piano ~7% in
+    # level relative to every other instrument.
+    ("Piano",    harmonic(PIANO_P, 2.95), (2, 450, 0.12, 450)),
     ("Guitar",   harmonic(GUITAR_P),     (3,  100, 0.25, 800)),
     ("Bass",     harmonic(BASS_P),       (3,  190, 0.15, 90)),
     ("Flute",    harmonic(FLUTE_P),      (90, 100, 0.92, 240)),

@@ -10,6 +10,13 @@ default takes ~100 ms, blowing the entire audio block budget on its own.
 Even at 400 kHz a full display.show() is ~23-25 ms -- more than the
 whole 16 ms block budget (see SAMPLE_RATE in main.py). Fixed by never
 calling display.show() at all -- see PAGE_HEIGHT / _push_page below.
+
+Pushing is also DEFERRED. displayState() draws into the framebuffer and
+queues the page numbers it touched; the actual I2C traffic happens in
+push_one(), which sends at most one 128-byte page (~3 ms) per call. The
+caller runs push_one() once per audio block, so a change that dirties
+all five text rows costs 3 ms on each of five passes instead of 15 ms on
+one -- see the SPIKE BUDGET note in main.py.
 """
 
 import ssd1306
@@ -62,26 +69,55 @@ def _push_page(page):
 # collide with a str.
 _page_last = {0: None, 1: None, 2: None, 3: None, 5: None}
 
+# Page numbers drawn into the framebuffer but not yet sent over I2C.
+# FIFO, and deliberately deduplicated on insert: if a page is dirtied
+# twice before it drains, the second draw has already overwritten the
+# first in the framebuffer, so queueing it twice would push identical
+# bytes twice and burn 3 ms for nothing.
+_pending = []
+
+
+def push_one():
+    """Send at most ONE queued page to the physical screen (~3 ms) and
+    return whether anything was sent. Call once per main-loop pass.
+
+    This is the whole point of the deferral: no single pass can spend
+    more than one page of I2C time, so the OLED can never be the reason
+    an audio block overruns. A five-page repaint takes five passes
+    (~80 ms at a 16 ms block) to appear in full, which is far below what
+    reads as lag on a status readout."""
+    if not _pending:
+        return False
+    _push_page(_pending.pop(0))
+    return True
+
+
+def flush():
+    """Drain the whole queue immediately, ignoring the one-per-pass
+    rule. STARTUP ONLY -- this is exactly the ~15 ms spike push_one()
+    exists to prevent, which is harmless before the audio loop starts
+    and unacceptable once it has."""
+    while _pending:
+        _push_page(_pending.pop(0))
+
 
 def displayState(st, looper):
     """Partial, CHANGE-DETECTED redraw: draws into display.buffer exactly
-    like a full redraw would, but pushes only the pages whose CONTENT
-    actually changed since the last call, as individual 128-byte page
-    writes -- never display.show(), which pushes all 1024 bytes every
-    time.
+    like a full redraw would, then QUEUES the pages whose CONTENT
+    actually changed since the last call. Sends nothing itself -- see
+    push_one() for the I2C side.
 
-    Pushing all 5 text pages unconditionally costs ~15 ms of I2C
-    transfer against a 16 ms block budget -- too tight to trust. The
-    common case (e.g. only the volume pot moved) needs one page
-    repainted, not five, so tracking each page's last-drawn string and
-    skipping unchanged ones keeps the typical call cheap.
+    Two independent savings, and both are needed. Change detection means
+    the common case (only the volume pot moved) queues one page instead
+    of five. Deferral means that even the worst case -- a preset cycle,
+    which changes key, octave, sample and mode together and so dirties
+    all five text rows -- cannot spend 15 ms of I2C inside a single 16 ms
+    audio block; it drains one page per pass instead.
 
-    ACCEPTED RISK: an action that changes all 5 pages at once (preset
-    cycle changes key/octave/sample/mode together) still costs ~15 ms
-    against the 16 ms budget and could overrun. Not spread across
-    multiple loop passes (would need a pending-pages queue) since it's a
-    rare, self-limiting case -- revisit if bench testing shows a click
-    specifically on preset switch.
+    This call is therefore cheap and UNCONDITIONAL in cost terms: a
+    handful of string builds plus some framebuffer writes, no bus
+    traffic. It is still rate-limited by the caller (OLED_MIN_INTERVAL_MS)
+    purely to avoid rebuilding those strings pointlessly.
 
     Rows 56-63 (page 7) belong to the looper's progress bar, pushed
     separately by loop.py -- never touched here.
@@ -152,5 +188,12 @@ def displayState(st, looper):
         elif page == 5:
             display.text(page5, 0, 40)
 
-        _push_page(page)
+        # Queue rather than push. _page_last is updated HERE, not when
+        # the page actually drains, because the framebuffer now holds
+        # this content -- a later call comparing against it is asking
+        # "is the buffer already correct?", not "is the screen already
+        # correct?", and re-drawing identical bytes would be wasted work
+        # either way.
+        if page not in _pending:
+            _pending.append(page)
         _page_last[page] = content

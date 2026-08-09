@@ -51,8 +51,8 @@ audio.write() blocks until the I2S peripheral has room, so the main loop
 runs once per audio block. Press-to-sound latency is the sum of two
 things, and the second is the one that bites:
 
-  1. button poll interval   = BUF_SAMPLES / SAMPLE_RATE        = 16 ms
-  2. audio already queued   = IBUF_BLOCKS * BUF_SAMPLES / RATE = 48 ms
+  1. button poll interval   = BUF_SAMPLES / SAMPLE_RATE        = 21.3 ms
+  2. audio already queued   = IBUF_BLOCKS * BUF_SAMPLES / RATE = 64 ms
 
 In steady state the I2S buffer stays FULL -- the writer runs ahead until
 write() blocks -- so every sample waits behind a full ibuf before it
@@ -60,10 +60,35 @@ reaches the DAC. Making the synth compute faster does not change this.
 Only shrinking the queue does.
 
 The tradeoff: a smaller ibuf means less slack, so any single loop pass
-that overruns 16 ms produces an audible click. A full OLED frame is the
-biggest spike (~25 ms), which is why the full redraw is rate-limited and
-the loop progress bar pushes only its own 128-byte page. Set
-TIMING = True and read the worst-case numbers before going tighter.
+that overruns 16 ms produces an audible click. See SPIKE BUDGET.
+
+SPIKE BUDGET  (why chords used to cut out)
+------------------------------------------
+Render cost scales with BUF_SAMPLES and so does the budget (BUF_SAMPLES /
+SAMPLE_RATE), so their ratio is fixed and a BIGGER BUFFER CANNOT FIX AN
+OVERRUN CAUSED BY RENDERING. That it did help was the diagnosis: the
+overruns were FIXED per-pass costs, which do not scale with the buffer
+and so shrink as a fraction of a longer block. Rather than pay latency to
+hide them, each is now capped at source:
+
+  serial   json.dumps + print allocates ~200 bytes and writes to USB
+           CDC, which BLOCKS if the host has the port open but is not
+           draining it -- tens of milliseconds, entirely outside our
+           control. A chord lands 2-3 button edges in consecutive
+           blocks and each one used to print. Now coalesced to one line
+           per JSON_MIN_INTERVAL_MS.
+
+  OLED     a preset cycle changes key, octave, sample and mode at once,
+           dirtying all 5 text rows: ~15 ms of I2C against a 16 ms
+           budget. display.py now queues pages and drains ONE (~3 ms)
+           per pass, and a pass that already pushed the loop progress
+           bar drains none.
+
+  GC       skipped on any pass that already did serial or OLED work, so
+           a collection cannot land on top of another spike.
+
+Worst case per pass is therefore one page of I2C plus at most one JSON
+line, never both plus a collection.
 
 MELODIC MINOR
 -------------
@@ -78,10 +103,15 @@ scale underneath it.
 
 SERIAL PROTOCOL
 ---------------
-Every state change prints one line: '#' + JSON. While the looper runs, a
-heartbeat line goes out every JSON_LOOP_INTERVAL_MS as well, so the
-website can animate loop position. The website reads only lines starting
-with '#'; anything else is human debug output. DEBUG = False silences it.
+State changes print one line: '#' + JSON, coalesced to at most one line
+per JSON_MIN_INTERVAL_MS (30 ms) -- quicker than a 30 fps video frame, so
+the visualiser cannot perceive the difference, while a fast chord can no
+longer queue three blocking USB writes into three consecutive audio
+blocks. While the looper runs a heartbeat goes out every
+JSON_LOOP_INTERVAL_MS (100 ms) so the website can animate loop position;
+that stays slower deliberately, since it fires continuously and change
+lines do not. The website reads only lines starting with '#'; anything
+else is human debug output. DEBUG = False silences it.
 
 JSON fields: preset, octave, key, sample, mode, volume, cutoff, keys[8],
 loop, loop_pos. `mode` is new as of this revision -- a visualizer reading
@@ -101,7 +131,6 @@ from keypad import scan_keypad
 from scale import shift_key, shift_octave, shift_mode, build_scale_freqs
 
 DEBUG = False     # per-keypress serial chatter
-TIMING = False    # per-section worst-case timing report (see MAIN LOOP)
 
 
 # ============================================================
@@ -114,32 +143,49 @@ TIMING = False    # per-section worst-case timing report (see MAIN LOOP)
 # allocations carve it up. Everything below is small and fits in
 # whatever heap is left.
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 12000
 BUF_SAMPLES = const(256)
 
-# Nyquist at 16000 Hz is 8000 Hz. The harmonic instrument recipes below
-# (Organ, Trumpet, Strings, etc.) stack partials up to the 10th harmonic,
-# so at lower sample rates high partials alias into audible garbage,
-# baked permanently into the wavetable at build time. KNOWN LIMITATION:
-# mid-range play is safely under Nyquist with margin; the richest
-# recipes can still alias in the top 1-2 octaves near MAX_OCTAVE=6.
-# Not band-limited per-note (would need a dynamic per-pitch table
-# rebuild) -- worth a bench-test check at the top of the range.
+# WHY 12000 AND NOT 16000
+# -----------------------
+# Block period is BUF_SAMPLES / SAMPLE_RATE, and the render work per
+# block is a fixed 256 iterations per active voice regardless of rate.
+# So the rate sets the BUDGET without changing the WORK:
 #
-# Cost: block period is BUF_SAMPLES / SAMPLE_RATE, so raising the rate
-# SHRINKS the audio timing budget -- 16.0 ms/block here. A full OLED
-# redraw (~25 ms even at 400 kHz I2C) would overrun that badly, which is
-# why display.py's displayState() never does a full redraw.
+#     16000 Hz -> 16.0 ms/block        12000 Hz -> 21.3 ms/block
+#
+# 16000 was a 30% pay cut on the audio budget bought for headroom above
+# Nyquist we were not using. It showed up as garbling that got worse the
+# more voices were held -- and, diagnostically, as garbling that
+# DISAPPEARED on loop playback. The looper records post-filter mix, so a
+# recording is a strictly lower-fidelity copy of the live signal; if it
+# plays back cleaner, the samples were always fine and the DAC was being
+# starved. That is an underrun, not a synthesis problem.
+#
+# Nyquist here is 6000 Hz. See N_MAX in instruments.py for how the
+# wavetables are band-limited to suit it, and CUTOFF_MAX_HZ below.
 
 # Size the I2S buffer for double/triple buffering, NOT a big safety
 # margin -- every extra block of ibuf is another block of latency between
-# a keypress and the sound. 3 blocks at 16000 Hz = 48 ms queued. Drop to
-# 2 for less latency if the timing harness shows headroom; raise to 4 if
-# you hear clicks. This is the single most important number in the file.
+# a keypress and the sound.
+#
+# LEFT AT 3 DELIBERATELY. Raising it to 4 was on the table while the rate
+# was still 16000, but a longer block period multiplies through here too:
+# total latency is (1 + IBUF_BLOCKS) * BUF_SAMPLES / SAMPLE_RATE, so at
+# 12000 Hz
+#
+#     IBUF 2 -> 64 ms      IBUF 3 -> 85 ms      IBUF 4 -> 107 ms
+#
+# and 4 would be audibly laggy to play. 3 gives 85 ms with a 21.3 ms
+# budget that the fixed-point voice render now fits inside several times
+# over. If clicks somehow persist, go to 4 before touching anything else
+# -- a laggy instrument still scores, one that cuts out does not. If it
+# is rock solid, 2 buys back the latency.
 IBUF_BLOCKS = 3
 
-# Two int16 buffers (base take + overdub layer): 4 s costs 250 KB at this
-# rate. The Looper backs off in half-second steps if that won't fit, so a
+# Two int16 buffers (base take + overdub layer): 4 s costs 188 KB at this
+# rate (down from 250 KB at 16000 -- the rate drop pays for itself in
+# heap as well as CPU). The Looper backs off in half-second steps if that won't fit, so a
 # tight board gets a shorter loop rather than a traceback -- the startup
 # banner prints what it actually got.
 LOOP_SECONDS = 4
@@ -337,15 +383,15 @@ _free = gc.mem_free()
 
 if _need > _free:
     # Every 0.5 s of LOOP_SECONDS is 0.5 * SAMPLE_RATE * 2 bytes * 2
-    # buffers = 32000 bytes, so the shortfall converts straight into the
-    # number of half-seconds of loop that have to go back.
+    # buffers = 24000 bytes at 12000 Hz, so the shortfall converts
+    # straight into the number of half-seconds of loop to give back.
     _short = _need - _free
     raise MemoryError(
         "drum bank needs ~" + str(_need) + " bytes (" + str(_need - _sizes[0][0])
         + " resident + " + str(_sizes[0][0]) + " peak on "
         + DRUM_FILES[_sizes[0][1]] + "), only " + str(_free)
         + " free -- short by " + str(_short) + ". Trim the longest samples, or"
-        + " drop LOOP_SECONDS by " + str((_short + 31999) // 32000 * 0.5) + " s")
+        + " drop LOOP_SECONDS by " + str((_short + 23999) // 24000 * 0.5) + " s")
 
 _slots = [None] * len(DRUM_FILES)
 for _sz, _i in _sizes:
@@ -582,6 +628,55 @@ _SUSTAIN = const(3)
 _RELEASE = const(4)
 
 
+# ---------------- Fixed-point scales for the voice render ----------------
+#
+# render_voice used to carry a float phase, a float envelope level, and a
+# float interpolation fraction. MicroPython boxes every float on the
+# heap, so the inner loop -- 256 iterations per voice per block, 2048
+# with 8 voices held -- was allocating constantly and running the slowest
+# arithmetic the interpreter has. That is what made CPU load track voice
+# count, and voice count is exactly the axis the garbling moved along.
+#
+# Everything below is integer. No allocation, no GC pressure, and the
+# whole loop stays inside MicroPython's 31-bit small-int range (+-1.07e9)
+# so nothing silently promotes to a heap-allocated big int.
+#
+# PHASE -- Q16.16. phase_inc = freq * TABLE_LEN * 65536 / SAMPLE_RATE.
+# Top note (octave 6, degree 7 = C7, 2093 Hz) gives ~2.9e6, far below
+# _PHASE_WRAP, which is what lets the wrap stay a single subtract rather
+# than a modulo.
+_PHASE_BITS = const(16)
+#
+# LITERAL, not const(TABLE_LEN << 16). MicroPython's const() folds at
+# COMPILE time, so its argument must be a literal or another const
+# declared in THIS module -- TABLE_LEN is imported from instruments.py,
+# which makes it a runtime name and raises "SyntaxError: not a constant".
+# The assert below is the price of hardcoding it: it costs one comparison
+# once at boot and makes a TABLE_LEN change fail loudly here instead of
+# detuning every note by a factor of two.
+_PHASE_WRAP = const(16777216)             # TABLE_LEN(256) << 16
+assert TABLE_LEN == 256, "_PHASE_WRAP hardcodes TABLE_LEN=256"
+
+# INTERPOLATION FRACTION -- Q8, NOT the full Q16. (s1 - s0) can reach
+# 64000, and 64000 * 65535 = 4.2e9 overflows a small int and would start
+# allocating big ints inside the audio loop. 64000 * 255 = 1.6e7 is
+# safe, and 256 steps between adjacent table entries is already finer
+# than the table's own 16-bit resolution can express.
+_FRAC_BITS = const(8)
+_FRAC_MASK = const(255)
+
+# ENVELOPE LEVEL -- Q23 for the accumulator, used at Q15 for the multiply.
+# Q15 alone is too coarse to ACCUMULATE in: Bell's release is 1900 ms
+# from a sustain of 0.22, which at 12000 Hz is 22800 samples of decay --
+# a Q15 step would round to 0, get forced to 1, and cut Bell's tail to a
+# third of its length. Q23 gives the step 256x the resolution, and
+# shifting down by 8 at the point of use keeps the multiply in range:
+# 32000 * 32768 = 1.048e9, just under the 1.07e9 small-int ceiling.
+_LVL_BITS = const(23)
+_LVL_ONE = const(8388608)                 # 1 << 23
+_LVL_TO_Q15 = const(8)                    # >> this before multiplying
+
+
 class Voice:
     # __slots__ avoids a per-instance dict: less RAM, faster attribute
     # access, and no dict growth to trigger GC mid-note.
@@ -591,37 +686,48 @@ class Voice:
     )
 
     def __init__(self):
+        # All integers -- see the fixed-point scale block above. Seeding
+        # these as floats would let the very first note run one block of
+        # mixed int/float arithmetic before note_on() overwrote them.
         self.active = False
         self.table = None
-        self.phase = 0.0
-        self.phase_inc = 0.0
+        self.phase = 0
+        self.phase_inc = 0
         self.stage = _IDLE
-        self.level = 0.0
-        self.attack_step = 0.0
-        self.decay_step = 0.0
-        self.sustain_level = 0.0
-        self.release_step = 0.0
+        self.level = 0
+        self.attack_step = 0
+        self.decay_step = 0
+        self.sustain_level = 0
+        self.release_step = 0
 
     def note_on(self, freq, instrument):
+        # Float maths is fine HERE -- note_on runs once per keypress, not
+        # once per sample. Everything it stores is an integer, so the
+        # render loop never sees a float.
         self.table = WAVETABLES.get(instrument, WAVETABLES["Sine"])
-        self.phase = 0.0
-        # Table steps per output sample. Stays < TABLE_LEN for every note
-        # in our range, which is what lets render_voice wrap with a single
-        # subtract instead of a modulo.
-        self.phase_inc = freq * TABLE_LEN / SAMPLE_RATE
+        self.phase = 0
+        # Q16.16 table steps per output sample. Stays well below
+        # _PHASE_WRAP for every note in our range, which is what lets
+        # render_voice wrap with a single subtract instead of a modulo.
+        self.phase_inc = int(freq * TABLE_LEN * 65536 / SAMPLE_RATE)
 
         a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(instrument, ENVELOPES["Sine"])
         a_samples = max(1, int(a_ms * SAMPLE_RATE / 1000))
         d_samples = max(1, int(d_ms * SAMPLE_RATE / 1000))
         r_samples = max(1, int(r_ms * SAMPLE_RATE / 1000))
 
-        self.attack_step = 1.0 / a_samples
-        self.decay_step = (1.0 - s_lvl) / d_samples
-        self.sustain_level = s_lvl
-        self.release_step = s_lvl / r_samples
+        s_level = int(s_lvl * _LVL_ONE)
+
+        # max(1, ...) on every step: a step that floors to 0 is a voice
+        # that never leaves its stage -- a note stuck on forever, which
+        # on stage is worse than any amount of envelope inaccuracy.
+        self.attack_step = max(1, _LVL_ONE // a_samples)
+        self.decay_step = max(1, (_LVL_ONE - s_level) // d_samples)
+        self.sustain_level = s_level
+        self.release_step = max(1, s_level // r_samples)
 
         self.stage = _ATTACK
-        self.level = 0.0
+        self.level = 0
         self.active = True
 
     def note_off(self):
@@ -671,10 +777,12 @@ MIX_HEADROOM = 3.0
 # is arranged to avoid.
 
 CUTOFF_MIN_HZ = 60
-# Kept just under Nyquist at the CURRENT SAMPLE_RATE, same margin as
-# before (roughly 500 Hz of headroom) -- this constant must move if
-# SAMPLE_RATE moves again. At 16000 Hz, Nyquist is 8000 Hz.
-CUTOFF_MAX_HZ = 7200
+# Kept just under Nyquist at the CURRENT SAMPLE_RATE -- this constant
+# must move whenever SAMPLE_RATE does. At 12000 Hz Nyquist is 6000 Hz;
+# 5400 keeps the same ~10% margin the 16000/7200 pair had. Fully open
+# (pct 100) bypasses the filter outright, so the ceiling only shapes the
+# top of the knob's travel.
+CUTOFF_MAX_HZ = 5400
 
 
 def _cutoff_k(pct):
@@ -700,23 +808,24 @@ lp_state = 0
 @micropython.native
 def render_voice(v, mix_buf, n_samples):
     """Add one voice's contribution to mix_buf, advancing its phase and
-    envelope. Every per-sample value is pulled into a local first --
-    self.x lookups are among the slowest operations in MicroPython and
-    this loop runs 256 times per voice per block.
+    envelope. INTEGER ONLY -- see the fixed-point scale block above for
+    why, and for the range analysis on every multiply in here.
 
-    LINEAR INTERPOLATION between the two nearest table samples: real
-    notes use phase increments of 10-70+ table-steps per output sample,
-    far above the table's 256-sample resolution, so nearest-neighbor
-    lookup produces a harsh "clicking" character that gets worse at
-    higher pitches. Interpolating smooths that into a clean tone at the
-    table's actual harmonic content. Cost is one extra array read,
-    subtract, multiply, and add per sample -- cheap next to the
-    envelope/mix work already happening here.
+    Every per-sample value is pulled into a local first: self.x lookups
+    are among the slowest operations in MicroPython and this loop runs
+    256 times per voice per block.
+
+    LINEAR INTERPOLATION between the two nearest table samples. Real
+    notes step 10-70+ table entries per output sample, far coarser than
+    the table's 256-entry resolution, so nearest-neighbour lookup
+    produces a harsh clicking character that worsens with pitch.
+    Interpolating smooths that to the table's actual harmonic content for
+    one extra read, subtract, multiply and shift -- all integer now.
 
     idx1 wraps to 0 only when idx0 == TABLE_LEN - 1 (right before phase
-    itself wraps) -- handled with one comparison rather than a modulo
-    every sample, since idx0 is already guaranteed to stay in
-    [0, TABLE_LEN) by the phase-wrap logic below."""
+    itself wraps), handled with one comparison rather than a modulo every
+    sample, since idx0 is kept in [0, TABLE_LEN) by the phase wrap
+    below."""
     table = v.table
     phase = v.phase
     phase_inc = v.phase_inc
@@ -729,22 +838,22 @@ def render_voice(v, mix_buf, n_samples):
 
     n = 0
     while n < n_samples:
-        idx0 = int(phase)
+        idx0 = phase >> _PHASE_BITS
+        s0 = table[idx0]
         idx1 = idx0 + 1
         if idx1 >= TABLE_LEN:
             idx1 = 0
-        frac = phase - idx0
-        s0 = table[idx0]
-        raw = s0 + (table[idx1] - s0) * frac
+        raw = s0 + (((table[idx1] - s0) * ((phase >> _FRAC_BITS) & _FRAC_MASK))
+                    >> _FRAC_BITS)
 
         phase += phase_inc
-        if phase >= TABLE_LEN:
-            phase -= TABLE_LEN
+        if phase >= _PHASE_WRAP:
+            phase -= _PHASE_WRAP
 
         if stage == _ATTACK:
             level += attack_step
-            if level >= 1.0:
-                level = 1.0
+            if level >= _LVL_ONE:
+                level = _LVL_ONE
                 stage = _DECAY
         elif stage == _DECAY:
             level -= decay_step
@@ -753,11 +862,14 @@ def render_voice(v, mix_buf, n_samples):
                 stage = _SUSTAIN
         elif stage == _RELEASE:
             level -= release_step
-            if level <= 0.0:
-                level = 0.0
+            if level <= 0:
+                level = 0
                 stage = _IDLE
 
-        mix_buf[n] += int(raw * level)
+        # Q23 level down to Q15 for the multiply, then back out of Q15.
+        # Peak is 32000 * 32768 >> 15 = 32000, i.e. one voice at full
+        # envelope reproduces the table amplitude exactly.
+        mix_buf[n] += (raw * (level >> _LVL_TO_Q15)) >> 15
         n += 1
 
         if stage == _IDLE:
@@ -842,6 +954,11 @@ def generate_block(volume_pct, cutoff_pct):
 
 sync_state()
 oled.displayState(state, looper)
+# displayState only QUEUES pages now, so the first paint needs an
+# explicit drain. flush() is the ~15 ms spike push_one() exists to avoid,
+# which is exactly why it is confined to here -- before the audio loop
+# starts there is no block budget to overrun.
+oled.flush()
 looper.update_bar(oled.display)
 
 print("--- Pico 2 W Music Controller | Team 13 ---")
@@ -855,11 +972,24 @@ print("free heap after init:", gc.mem_free())
 print("#" + json.dumps(state))
 
 oled_dirty = False
+json_dirty = False
 oled_last_ms = time.ticks_ms()
 bar_last_ms = time.ticks_ms()
 json_last_ms = time.ticks_ms()
 
-# Heartbeat rate for loop position while the looper runs. The visualiser
+# Floor on the gap between change-driven JSON lines. Not a delay -- a
+# line still goes out on the very first pass after an edit if this much
+# time has already elapsed, which it usually has. What it prevents is a
+# burst: pressing three notes for a chord produces three button edges in
+# three consecutive 16 ms blocks, and printing each one meant three
+# blocking USB writes inside 48 ms of audio. 30 ms is under one frame at
+# 30 fps, so the visualiser cannot tell.
+JSON_MIN_INTERVAL_MS = 30
+
+# Heartbeat rate for loop position while the looper runs. Slower than
+# JSON_MIN_INTERVAL_MS on purpose: this one fires continuously for as
+# long as the loop plays, so it sets the floor on idle serial traffic,
+# whereas change lines are bursty and self-limiting. The visualiser
 # needs a moving loop_pos, but a full OLED redraw at this rate would
 # overrun the audio budget -- so the serial line and the screen are
 # deliberately on separate clocks.
@@ -869,12 +999,13 @@ JSON_LOOP_INTERVAL_MS = 100
 # rather than letting an allocation trigger one at an arbitrary moment
 # mid-block. ~every 0.5 s at these settings.
 GC_EVERY_N_BLOCKS = 20
-block_count = 0
 
-# Timing harness: worst-case microseconds per section since the last
-# report. Only touched when TIMING is True.
-t_max = [0, 0, 0, 0, 0]   # buttons, pots, keypad, display+serial, audio
-t_report_ms = time.ticks_ms()
+# Hard ceiling on deferring a collection past a busy pass. Without it, a
+# sustained run of passes that all print or push would starve GC until an
+# allocation forces one mid-block, which is precisely the arbitrary pause
+# that scheduling collection here is meant to prevent.
+GC_MAX_BLOCKS = 40
+block_count = 0
 
 
 # ============================================================
@@ -886,8 +1017,6 @@ while True:
     changed = False
     preset = presets[active_preset]
 
-    if TIMING:
-        t0 = time.ticks_us()
 
     # --- 8 note buttons -> voices ------------------------------------
     for i in range(NUM_VOICES):
@@ -942,8 +1071,6 @@ while True:
         prev_key_bits[:] = key_bits
         changed = True
 
-    if TIMING:
-        t1 = time.ticks_us()
 
     # --- pots: volume (GP26) and filter cutoff (GP27) -----------------
     volume = read_pot(POT_VOLUME)
@@ -958,8 +1085,6 @@ while True:
         state["cutoff"] = cutoff
         changed = True
 
-    if TIMING:
-        t2 = time.ticks_us()
 
     # --- keypad -------------------------------------------------------
     pressed_key = scan_keypad()
@@ -1044,37 +1169,67 @@ while True:
         elif DEBUG:
             print("[debug] key", pressed_key, "unassigned")
 
-    if TIMING:
-        t3 = time.ticks_us()
 
-    # --- serial (immediate + loop heartbeat), OLED (rate limited) -----
+    # --- serial (coalesced), OLED (queued, one page per pass) ---------
     now_ms = time.ticks_ms()
 
     loop_running = looper.is_sounding() or looper.state == loop.RECORDING
 
-    if changed or (loop_running and
-                   time.ticks_diff(now_ms, json_last_ms) >= JSON_LOOP_INTERVAL_MS):
+    if changed:
+        # Runs at the edge that caused the change, NOT deferred with the
+        # print below. It is four dict copies, so it costs nothing -- and
+        # the OLED redraw reads `state`, so deferring it would let the
+        # screen paint a stale mirror whenever a redraw landed between an
+        # edit and its JSON line.
         sync_state()
+        json_dirty = True
+        oled_dirty = True
+
+    # Two clocks, one printer. A pending change uses the fast floor; a
+    # free-running loop heartbeat uses the slow one. Checked in this
+    # order so an edit made mid-loop is not held back to heartbeat rate.
+    if json_dirty:
+        json_due = JSON_MIN_INTERVAL_MS
+    elif loop_running:
+        json_due = JSON_LOOP_INTERVAL_MS
+    else:
+        json_due = -1     # nothing to say
+
+    # json_printed, not json_dirty, is what the GC guard below reads:
+    # printing CLEARS json_dirty, so a pass that just paid for a blocking
+    # USB write would otherwise look idle and get a collection stacked on
+    # top of it -- the exact pairing this is all meant to prevent.
+    json_printed = False
+    if json_due >= 0 and time.ticks_diff(now_ms, json_last_ms) >= json_due:
         state["loop"] = looper.state_name()
         state["loop_pos"] = looper.progress()
         print("#" + json.dumps(state))
         json_last_ms = now_ms
-        if changed:
-            oled_dirty = True
+        json_dirty = False
+        json_printed = True
 
     if oled_dirty and time.ticks_diff(now_ms, oled_last_ms) >= oled.OLED_MIN_INTERVAL_MS:
+        # Draws into the framebuffer and queues the changed pages. Sends
+        # no I2C itself -- that happens in push_one() below, one page at
+        # a time, so a 5-page repaint cannot land inside one block.
         oled.displayState(state, looper)
         oled_last_ms = now_ms
         oled_dirty = False
 
     # Progress bar on its own, faster clock. Pushes one 128-byte page
     # rather than a 1 KB frame, so 20 fps costs ~3 ms a tick.
+    bar_pushed = False
     if loop_running and time.ticks_diff(now_ms, bar_last_ms) >= oled.BAR_INTERVAL_MS:
         looper.update_bar(oled.display)
         bar_last_ms = now_ms
+        bar_pushed = True
 
-    if TIMING:
-        t4 = time.ticks_us()
+    # ONE page of I2C per pass, total -- the bar and the status rows share
+    # both the bus and the 16 ms budget, so a pass that already spent
+    # ~3 ms on the bar does not also spend 3 ms here. The queue simply
+    # drains a pass later, which is 16 ms nobody can see.
+    oled_pushed = False if bar_pushed else oled.push_one()
+
 
     # --- audio: must run every pass, unconditionally -------------------
     # Silence fast path: skip the clear, the voice/drum idle checks, and
@@ -1118,30 +1273,11 @@ while True:
     # -- the moment with the most slack in the whole loop.
     block_count += 1
     if block_count >= GC_EVERY_N_BLOCKS:
-        block_count = 0
-        gc.collect()
-
-    if TIMING:
-        t5 = time.ticks_us()
-        spans = (
-            time.ticks_diff(t1, t0),   # buttons
-            time.ticks_diff(t2, t1),   # pots
-            time.ticks_diff(t3, t2),   # keypad
-            time.ticks_diff(t4, t3),   # display + serial
-            time.ticks_diff(t5, t4),   # render + write + gc
-        )
-        for idx in range(5):
-            if spans[idx] > t_max[idx]:
-                t_max[idx] = spans[idx]
-
-        if time.ticks_diff(time.ticks_ms(), t_report_ms) >= 1000:
-            # Budget is per block. The audio span includes the blocking
-            # write(), so it sits near budget by definition -- the
-            # numbers that matter are the other four, whose sum has to
-            # fit in the slack.
-            print("[timing] worst us: btn={} pot={} pad={} disp={} audio={}"
-                  "  budget={}  free={}".format(
-                      t_max[0], t_max[1], t_max[2], t_max[3], t_max[4],
-                      BUF_SAMPLES * 1000000 // SAMPLE_RATE, gc.mem_free()))
-            t_max = [0, 0, 0, 0, 0]
-            t_report_ms = time.ticks_ms()
+        # Hold off if this pass already spent its slack on a JSON line or
+        # a page push -- stacking a collection on top of another spike is
+        # how a pass overruns. GC_MAX_BLOCKS stops that deferral from
+        # running forever.
+        if ((not json_printed and not bar_pushed and not oled_pushed)
+                or block_count >= GC_MAX_BLOCKS):
+            block_count = 0
+            gc.collect()

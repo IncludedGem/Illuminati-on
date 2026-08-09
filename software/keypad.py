@@ -30,9 +30,13 @@ def scan_keypad():
     None. Never blocks -- important, because this runs inside the audio
     loop's time budget.
 
-    Note the sampling limit: this runs once per audio block (~23 ms), so
-    a tap shorter than that can fall entirely between two scans. Press
-    keypad keys deliberately on stage."""
+    Note the sampling limit: this runs once per audio block, which is
+    BUF_SAMPLES / SAMPLE_RATE in main.py -- 21.3 ms at 256 samples and
+    12000 Hz. A tap shorter than that can fall entirely between two
+    scans, so press keypad keys deliberately on stage. (This comment
+    said 23 ms for a while after the rate moved to 16000, which put the
+    real figure at 16 ms; it is derived, not fixed, so re-read it from
+    those two constants rather than trusting the number here.)"""
     now = time.ticks_ms()
     just_pressed = None
 
