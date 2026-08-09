@@ -1,252 +1,174 @@
-"""
-8-NOTE SYNTHESIZER (instruments.py edition)
--------------------------------------------
-Same behavior as the working standalone synth -- each of the 8 buttons
-plays its own fixed note -- but all wavetable/envelope definitions now
-come from instruments.py (the single source of truth) instead of being
-duplicated here.
+"""Wavetables and the instrument table (single source of truth).
 
-What moved OUT of this file and into instruments.py:
-  - make_table / all the *_fn waveform recipes
-  - WAVETABLES and ENVELOPES dicts
-  - TABLE_LEN
+Importing this module builds 15 wavetables at import time. main.py's
+Looper needs an unfragmented heap for its ~188 KB buffers, so this must be
+imported AFTER the Looper is constructed, never before.
 
-What this file keeps:
-  - Buttons, I2S setup, Voice class, mixing/render loop, main loop.
-
-IMPORTANT DIFFERENCES vs. the old standalone script:
-  1) SAMPLE_RATE is 12000, not 11025. instruments.py band-limits every
-     table with N_MAX = 5, which is computed against a 6000 Hz Nyquist
-     (i.e., a 12 kHz sample rate). Running its tables at 11025 would
-     quietly shift the band-limit math; if you ever change SAMPLE_RATE
-     here, re-tune N_MAX in instruments.py to match.
-  2) Instrument names must be keys that exist in instruments.INSTRUMENTS.
-     The old script's set is a subset of the new one (you also gain
-     Sine, Square, Triangle, Pulse). "Drums" is in SAMPLE_LIST but has
-     no wavetable -- don't set INSTRUMENT to "Drums" in this standalone
-     synth; drum dispatch lives in the full main.py, not here.
-  3) If your full main.py has the Looper, import instruments AFTER the
-     Looper allocates its buffers (see the allocation-order warning at
-     the top of instruments.py). This standalone script has no Looper,
-     so importing at the top is fine.
-
-Pins (unchanged):
-  Buttons -> GPIO15, 14, 13, 12, 11, 10, 9, 8 (active-low, internal pull-ups)
-  I2S DAC -> sck=GPIO16, ws=GPIO17, sd=GPIO18
+Pure Python/math otherwise -- no hardware.
 """
 
+import math
 from machine import Pin, I2S
 from array import array
+from micropython import const
 
-# No Looper in this standalone script, so importing here is safe.
-# In the full main.py this import must come AFTER `looper = loop.Looper(...)`.
-from instruments import WAVETABLES, ENVELOPES, TABLE_LEN
+TABLE_LEN = const(256)
+TABLE_AMP = 32000
 
-# ---------------- Buttons ----------------
+# Band limit. A wavetable is sampled once at build time, so any partial
+# above Nyquist folds down into the audible band permanently -- no
+# downstream lowpass can remove it. Nyquist at 12000 Hz is 6000 Hz, and
+# how many harmonics fit depends on the note, so a shared table has to be
+# sized for a design pitch:
+#
+#   octave 4 top (C5, 523 Hz)  -> 11 harmonics fit
+#   octave 5 top (C6, 1046 Hz) ->  5 harmonics fit
+#   octave 6 top (C7, 2093 Hz) ->  2 harmonics fit
+#
+# 5 sizes the tables for the top of octave 5. Known limitation: octave 6
+# still folds. Sizing for it would reduce every instrument to a near-sine
+# to protect a register nobody plays in. The real fix is per-pitch
+# mip-mapped tables, which is a rebuild-on-note-on cost we cannot afford.
+N_MAX = 5
 
-BUTTON_PINS = [15, 14, 13, 12, 11, 10, 9, 8]
-buttons = [Pin(p, Pin.IN, Pin.PULL_UP) for p in BUTTON_PINS]
-previous = [False] * len(buttons)
 
-# One note per button, in the same order as BUTTON_PINS.
-# Default: C major scale, C4 through C5.
-NOTE_FREQS = [
-    261.63,  # C4
-    293.66,  # D4
-    329.63,  # E4
-    349.23,  # F4
-    392.00,  # G4
-    440.00,  # A4
-    493.88,  # B4
-    523.25,  # C5
-]
+def make_table(fn):
+    """Sample one cycle of fn(t), t in [0,1), into a signed 16-bit table."""
+    return array("h", [int(fn(i / TABLE_LEN) * TABLE_AMP)
+                       for i in range(TABLE_LEN)])
 
-# ---------------- I2S output ----------------
 
-# 12000, NOT 11025: instruments.py's N_MAX = 5 band limit is sized for a
-# 6000 Hz Nyquist. See "IMPORTANT DIFFERENCES" in the header docstring.
-SAMPLE_RATE = 12000
-BUF_SAMPLES = 1024  # fewer I2S.write() calls, less overhead
+def harmonic(partials, norm=None):
+    """Build a waveform function from (harmonic multiple, amplitude) pairs.
 
-audio = I2S(
-    0,
-    sck=Pin(16),
-    ws=Pin(17),
-    sd=Pin(18),
-    mode=I2S.TX,
-    bits=16,
-    format=I2S.MONO,
-    rate=SAMPLE_RATE,
-    ibuf=8192,
+    Partials above N_MAX are dropped here, so every recipe below can be
+    written at its musically correct spectrum and still come out band
+    limited. norm defaults to the sum of the amplitudes that survived,
+    which guarantees |output| <= 1 so the table cannot clip; normalising
+    against the untrimmed sum would leave trimmed instruments quiet.
+    """
+    partials = tuple((m, a) for m, a in partials if m <= N_MAX)
+    if norm is None:
+        norm = sum(amp for _, amp in partials)
+    two_pi = 2 * math.pi
+
+    def fn(t):
+        v = 0.0
+        for mult, amp in partials:
+            v += amp * math.sin(two_pi * mult * t)
+        return v / norm
+
+    return fn
+
+
+# --- Geometric waveforms, built additively so they band-limit ---
+# Sampling an ideal square or saw puts a step discontinuity in the table,
+# and a step contains harmonics up to the 128th -- nearly all above Nyquist
+# here. Building them from their Fourier series instead lets harmonic()
+# apply N_MAX to them like any other instrument.
+
+SAW_P = tuple((n, 1.0 / n) for n in range(1, N_MAX + 1))
+
+# Odd harmonics only -- the missing evens are why a square is hollow.
+SQUARE_P = tuple((n, 1.0 / n) for n in range(1, N_MAX + 1, 2))
+
+# Amplitude goes as |sin(n*pi*d)|/n for duty d; at d=1/4 every 4th vanishes.
+PULSE25_P = tuple((n, abs(math.sin(n * math.pi * 0.25)) / n)
+                  for n in range(1, N_MAX + 1))
+
+
+def triangle_fn(t):
+    # Kept geometric: harmonics roll off as 1/n^2, so whatever folds is
+    # already 40 dB down by the 9th.
+    return 4.0 * abs(t - 0.5) - 1.0
+
+
+# --- Harmonic recipes: (harmonic multiple, amplitude) ---
+# The physics behind each spectrum is the defensible part of this file.
+
+# Organ depth comes from many pipes sounding at once, not one pipe's
+# timbre -- the fix for a thin organ is more ranks, not a louder fundamental.
+ORGAN_P = ((1, 1.00), (2, 0.75), (3, 0.50), (4, 0.40), (5, 0.25),
+           (6, 0.20), (8, 0.15), (9, 0.10), (10, 0.08), (12, 0.05))
+
+# Bells are dominated by non-integer partials; that inharmonicity matters
+# more to the identity than any amount of normal harmonics.
+BELL_P = ((1, 1.00), (2.71, 0.55), (4.07, 0.32), (5.83, 0.22), (7.91, 0.12))
+
+# Young's plucked-string theorem: harmonic n goes as sin(n*pi*p)/n for
+# pluck position p. p = 1/8 is a harpsichord plectrum near the bridge.
+PLUCK_P = ((1, 1.00), (2, 0.92), (3, 0.81), (4, 0.65), (5, 0.48), (6, 0.31))
+
+# Same theorem at p = 1/5 (nylon, plucked over the soundhole). n=5 is
+# absent because plucking at 1/5 puts a node there, so it cannot be excited.
+GUITAR_P = ((1, 1.00), (2, 0.81), (3, 0.54), (4, 0.25), (6, 0.17))
+
+# Piano strings are stiff, so partials sit slightly sharp of integer
+# multiples. That detuning is what keeps it from sounding like an organ.
+PIANO_P = ((1, 1.00), (2.01, 0.62), (3.02, 0.38), (4.04, 0.24),
+           (5.08, 0.16), (6.13, 0.10), (7.20, 0.06))
+
+BASS_P = ((1, 1.00), (2, 0.48), (3, 0.22), (4, 0.10))
+
+# Genuinely harmonic-poor -- the weakness is the flute. Do not enrich it.
+FLUTE_P = ((1, 1.00), (2, 0.15), (3, 0.07), (4, 0.03), (5, 0.015), (6, 0.008))
+
+# Closed cylindrical pipe, so odd harmonics dominate. Weighted toward the
+# low register where the fundamental carries most of the energy.
+CLARINET_P = ((1, 1.00), (2, 0.08), (3, 0.55), (4, 0.10),
+              (5, 0.30), (7, 0.14), (9, 0.08))
+
+# Nonlinear wave steepening down the bore pushes energy into high
+# harmonics -- why a trumpet is brighter than a conical-bore flugelhorn.
+TRUMPET_P = ((1, 1.00), (2, 0.85), (3, 0.72), (4, 0.58), (5, 0.46),
+             (6, 0.36), (7, 0.27), (8, 0.20), (9, 0.14), (10, 0.09))
+
+STRINGS_P = ((1, 1.00), (2, 0.72), (3, 0.50), (4, 0.35),
+             (5, 0.24), (6, 0.16), (7, 0.10), (8, 0.06))
+
+
+# --- Instrument table ---
+# One ordered tuple defines the name, waveform, envelope, and the keypad
+# cycling order. A tuple, not a dict: MicroPython does not preserve dict
+# insertion order, which would make the sample keys unrehearsable on stage.
+#
+# Envelope = (attack_ms, decay_ms, sustain_level, release_ms)
+
+INSTRUMENTS = (
+    ("Sine",     harmonic(((1, 1.0),)),  (10,  80, 0.85, 150)),
+    ("Square",   harmonic(SQUARE_P),     (5,   60, 0.80, 100)),
+    ("Sawtooth", harmonic(SAW_P),        (15, 120, 0.75, 200)),
+    ("Triangle", triangle_fn,            (10, 100, 0.85, 180)),
+    ("Pulse",    harmonic(PULSE25_P),    (5,   60, 0.75, 120)),
+
+    ("Organ",    harmonic(ORGAN_P),      (12,  40, 0.97, 400)),
+    ("Bell",     harmonic(BELL_P),       (1,  400, 0.22, 1900)),
+    ("Pluck",    harmonic(PLUCK_P),      (2,  200, 0.09, 90)),
+    # norm is deliberately above the amplitude sum: piano's inharmonic
+    # partials beat against each other and read louder than the sum
+    # predicts. The original 3.15 against an untrimmed sum of 2.56 is a
+    # factor of 1.23; N_MAX leaves a sum of 2.40, so 2.95 keeps the ratio.
+    ("Piano",    harmonic(PIANO_P, 2.95), (2, 450, 0.12, 450)),
+    ("Guitar",   harmonic(GUITAR_P),     (3,  100, 0.25, 800)),
+    ("Bass",     harmonic(BASS_P),       (3,  190, 0.15, 90)),
+    ("Flute",    harmonic(FLUTE_P),      (90, 100, 0.92, 240)),
+    ("Clarinet", harmonic(CLARINET_P),   (20,  45, 0.94, 150)),
+    ("Trumpet",  harmonic(TRUMPET_P),    (25,  50, 0.85, 160)),
+    ("Strings",  harmonic(STRINGS_P),    (140, 100, 0.92, 550)),
 )
 
-# Which instrument all 8 buttons use. Any name from instruments.INSTRUMENTS:
-# "Sine", "Square", "Sawtooth", "Triangle", "Pulse", "Organ", "Bell",
-# "Pluck", "Piano", "Guitar", "Bass", "Flute", "Clarinet", "Trumpet",
-# "Strings". (NOT "Drums" -- no wavetable; see header.)
-INSTRUMENT = "Organ"
+WAVETABLES = {name: make_table(fn) for name, fn, _ in INSTRUMENTS}
+ENVELOPES = {name: env for name, _, env in INSTRUMENTS}
 
-# ---------------- Voices ----------------
+# "Drums", not "Drum Kit": the OLED's "Sample: <name>" row is already at
+# its 128px limit for the longest existing names.
+DRUM_KIT_NAME = "Drums"
 
-NUM_VOICES = len(BUTTON_PINS)  # one voice per button
-
-
-class Voice:
-    __slots__ = (
-        "active", "table", "phase", "phase_inc", "stage", "level",
-        "attack_step", "decay_step", "sustain_level", "release_step",
-    )
-
-    def __init__(self):
-        self.active = False
-        self.table = None
-        self.phase = 0.0
-        self.phase_inc = 0.0
-        self.stage = "idle"  # idle, attack, decay, sustain, release
-        self.level = 0.0
-        self.attack_step = 0.0
-        self.decay_step = 0.0
-        self.sustain_level = 0.0
-        self.release_step = 0.0
-
-    def note_on(self, freq, instrument):
-        self.table = WAVETABLES.get(instrument, WAVETABLES["Piano"])
-        self.phase = 0.0
-        self.phase_inc = freq * TABLE_LEN / SAMPLE_RATE
-
-        a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(instrument, ENVELOPES["Piano"])
-        a_samples = max(1, int(a_ms * SAMPLE_RATE / 1000))
-        d_samples = max(1, int(d_ms * SAMPLE_RATE / 1000))
-        r_samples = max(1, int(r_ms * SAMPLE_RATE / 1000))
-
-        self.attack_step = 1.0 / a_samples
-        self.decay_step = (1.0 - s_lvl) / d_samples
-        self.sustain_level = s_lvl
-        self.release_step = s_lvl / r_samples
-
-        self.stage = "attack"
-        self.level = 0.0
-        self.active = True
-
-    def note_off(self):
-        if self.active and self.stage != "release":
-            self.stage = "release"
+SAMPLE_LIST = tuple(name for name, _, _ in INSTRUMENTS) + (DRUM_KIT_NAME,)
 
 
-voices = [Voice() for _ in range(NUM_VOICES)]
-VOLUME = 80  # 0-100, fixed
-
-# ---------------- Button handling ----------------
-
-
-def poll_buttons():
-    global previous
-
-    raw = [b.value() == 0 for b in buttons]  # True = pressed
-    if raw == previous:
-        return
-
-    for i in range(NUM_VOICES):
-        pressed = raw[i]
-        was_pressed = previous[i]
-        if pressed and not was_pressed:
-            voices[i].note_on(NOTE_FREQS[i], INSTRUMENT)
-        elif not pressed and was_pressed:
-            voices[i].note_off()
-
-    previous = raw
-
-
-# ---------------- Audio generation ----------------
-
-# mix_buf is a wider int32 accumulator so multiple voices can sum into it
-# before we clip once at the end -- avoids per-voice-per-sample clipping.
-mix_buf = array("l", [0] * BUF_SAMPLES)
-out_buf = array("h", [0] * BUF_SAMPLES)
-
-
-@micropython.native
-def render_voice(v, mix_buf, n_samples):
-    """Render one voice's contribution into mix_buf, advancing its
-    phase/envelope. All per-sample state lives in locals, not on self,
-    which is the single biggest speed win here."""
-    table = v.table
-    phase = v.phase
-    phase_inc = v.phase_inc
-    stage = v.stage
-    level = v.level
-    attack_step = v.attack_step
-    decay_step = v.decay_step
-    sustain_level = v.sustain_level
-    release_step = v.release_step
-
-    n = 0
-    while n < n_samples:
-        idx = int(phase) % TABLE_LEN
-        raw = table[idx]
-
-        phase += phase_inc
-        if phase >= TABLE_LEN:
-            phase -= TABLE_LEN
-
-        if stage == "attack":
-            level += attack_step
-            if level >= 1.0:
-                level = 1.0
-                stage = "decay"
-        elif stage == "decay":
-            level -= decay_step
-            if level <= sustain_level:
-                level = sustain_level
-                stage = "sustain"
-        elif stage == "release":
-            level -= release_step
-            if level <= 0.0:
-                level = 0.0
-                stage = "idle"
-
-        mix_buf[n] += int(raw * level)
-        n += 1
-
-        if stage == "idle":
-            break  # remaining samples in this block get 0 from this voice
-
-    v.phase = phase
-    v.stage = stage
-    v.level = level
-    if stage == "idle":
-        v.active = False
-
-
-@micropython.native
-def generate_block():
-    vol = VOLUME / 100.0
-
-    i = 0
-    while i < BUF_SAMPLES:
-        mix_buf[i] = 0
-        i += 1
-
-    for v in voices:
-        if v.active:
-            render_voice(v, mix_buf, BUF_SAMPLES)
-
-    i = 0
-    while i < BUF_SAMPLES:
-        total = int(mix_buf[i] * vol)
-        if total > 32000:
-            total = 32000
-        elif total < -32000:
-            total = -32000
-        out_buf[i] = total
-        i += 1
-
-
-# ---------------- Main loop ----------------
-
-print("Synth ready.")
-
-while True:
-    poll_buttons()
-    generate_block()
-    audio.write(out_buf)
+def shift_sample(current_sample, step):
+    """Step through SAMPLE_LIST, wrapping. Includes Drums -- what differs
+    about drums happens at the note-on dispatch in main.py, not here."""
+    idx = SAMPLE_LIST.index(current_sample)
+    return SAMPLE_LIST[(idx + step) % len(SAMPLE_LIST)]
