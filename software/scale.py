@@ -1,10 +1,4 @@
-"""Key, octave, and scale/mode theory.
-
-Pure functions and lookup tables -- no hardware, no shared mutable state
-with the rest of the project. Melodic Minor is direction-sensitive (its
-6th and 7th degrees differ ascending vs. descending); see
-scale_step_for_degree() and build_scale_freqs().
-"""
+"""Key, octave, and scale/mode theory. Pure functions, no hardware."""
 
 CHROMATIC_SCALE = (
     "C", "C#", "D", "D#", "E", "F",
@@ -14,12 +8,8 @@ CHROMATIC_SCALE = (
 MIN_OCTAVE = 2
 MAX_OCTAVE = 6
 
-# Semitone offsets, including the octave on top, so the 8 buttons play
-# root-to-root (e.g. C4..C5). Tuple values, not lists -- these are read
-# constantly and never mutated.
-#
-# The 7 diatonic modes (Ionian..Locrian) plus harmonic minor. Each is a
-# fixed rotation/alteration of the same 8-degree shape.
+# Semitone offsets including the octave on top, so the 8 buttons play
+# root to root (C4..C5). The 7 diatonic modes plus harmonic minor.
 MODE_STEPS = {
     "Major":          (0, 2, 4, 5, 7, 9, 11, 12),   # Ionian
     "Dorian":         (0, 2, 3, 5, 7, 9, 10, 12),
@@ -31,19 +21,13 @@ MODE_STEPS = {
     "Harmonic Minor": (0, 2, 3, 5, 7, 8, 11, 12),
 }
 
-# Real melodic minor is not one fixed scale -- the 6th and 7th degrees
-# depend on melodic direction:
-#   ascending:  raised 6th & 7th (strong leading tone into the octave)
-#   descending: natural 6th & 7th (same as natural minor)
-# Handled separately from MODE_STEPS for that reason; see
-# scale_step_for_degree() and the MELODIC MINOR note in main.py's
-# module docstring.
+# Melodic minor is direction-sensitive: raised 6th and 7th ascending,
+# natural descending. Handled separately from MODE_STEPS for that reason.
 MELODIC_MINOR_ASCENDING_STEPS = (0, 2, 3, 5, 7, 9, 11, 12)
 MELODIC_MINOR_DESCENDING_STEPS = MODE_STEPS["Natural Minor"]
 
-# Cycling order for keypad key '6'. Tuple, not a dict -- MicroPython
-# does not preserve dict insertion order, and deriving cycle order from
-# one would scramble it and make the mode key unrehearsable on stage.
+# Cycling order for keypad key 6. A tuple, not a dict -- MicroPython does
+# not preserve dict insertion order, which would scramble the cycle.
 MODE_LIST = (
     "Major",
     "Natural Minor",
@@ -56,12 +40,8 @@ MODE_LIST = (
     "Locrian",
 )
 
-# OLED labels ARE shown (see displayState()'s "Mode: " prefix), but the
-# mode VALUE still needs to be short: "Mode: Harmonic Minor" is 160px,
-# wider than the 128px screen, so the full mode name literally cannot
-# render even with the whole row to itself. 8 chars is the practical
-# ceiling for the value at 8px-wide default font, once "Mode: " (6 chars)
-# is accounted for.
+# Abbreviated for the OLED: "Mode: Harmonic Minor" is 160px on a 128px
+# screen, so the value has a practical ceiling of 8 characters.
 MODE_DISPLAY_LABEL = {
     "Major":          "Major",
     "Natural Minor":  "NatMin",
@@ -82,22 +62,19 @@ def shift_key(current_key, step):
 
 
 def shift_octave(current_octave, step):
-    """Shift octave by `step`, clamped (no wrap -- wrapping mid-song
-    would jump the instrument three octaves on a single keypress)."""
+    """Shift octave, clamped -- wrapping would jump three octaves mid-song."""
     return max(MIN_OCTAVE, min(MAX_OCTAVE, current_octave + step))
 
 
 def shift_mode(current_mode, step):
-    """Step through MODE_LIST, wrapping. `step` is always +-1 from the
-    keypad today, but this takes a step count (not just "next") to
-    match shift_key/shift_octave/shift_sample's shape."""
+    """Step through MODE_LIST, wrapping."""
     idx = MODE_LIST.index(current_mode)
     return MODE_LIST[(idx + step) % len(MODE_LIST)]
 
 
 def scale_step_for_degree(mode, degree_index, ascending):
-    """Which semitone step to use for one button/degree (0-7),
-    accounting for melodic minor's direction-dependent 6th/7th."""
+    """Semitone step for one button/degree (0-7), handling melodic minor's
+    direction-dependent 6th and 7th."""
     if mode == "Melodic Minor":
         return (MELODIC_MINOR_ASCENDING_STEPS if ascending
                 else MELODIC_MINOR_DESCENDING_STEPS)[degree_index]
@@ -105,15 +82,11 @@ def scale_step_for_degree(mode, degree_index, ascending):
 
 
 def build_scale_freqs(key, octave, mode, degree_index, ascending):
-    """One frequency (Hz) for a single note button, in `key`/`octave`,
-    using `mode` (direction-aware for Melodic Minor via `ascending`).
-    Equal temperament, A4 = 440 Hz.
+    """Frequency (Hz) for a single note button. Equal temperament, A4=440.
 
-    Takes ONE degree, not all 8 -- Melodic Minor needs a per-note
-    ascending/descending direction that can differ button to button
-    within the same keypress batch, so the note-on loop calls this once
-    per newly-pressed button instead of computing the whole scale up
-    front."""
+    Takes one degree rather than all 8, because melodic minor's direction
+    can differ button to button within the same keypress batch.
+    """
     root_idx = CHROMATIC_SCALE.index(key)
     step = scale_step_for_degree(mode, degree_index, ascending)
     total = root_idx + step
