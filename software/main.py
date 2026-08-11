@@ -286,6 +286,11 @@ def render_drum_voice(v, mix_buf, n_samples):
 
 PRESET_FIELDS = ("octave", "key", "sample", "mode")
 
+# Fallback instrument for ENVELOPES.get() in Voice.note_on when an
+# instrument name isn't found in the envelope table. Must be a real key
+# in ENVELOPES (see instruments.py).
+DEFAULT_SAMPLE = "Piano"
+
 presets = [
     {"octave": 4, "key": "C", "sample": "Piano", "mode": "Major"},
     {"octave": 5, "key": "F", "sample": "Organ", "mode": "Major"},
@@ -546,6 +551,18 @@ silence_buf = array("h", [0] * BUF_SAMPLES)   # written directly when idle
 # if chords crunch; 1.0 is the useful floor.
 MIX_HEADROOM = 1.2
 
+# Q10 master gain per volume percent (0-100), precomputed so generate_block
+# does zero float math in the audio path. Same curve as (pct/100)^2 / MIX_HEADROOM.
+VOL_TABLE = tuple(
+    max(0, min(1024, int((p / 100.0) ** 2 / MIX_HEADROOM * 1024)))
+    for p in range(101)
+)
+
+# Soft-knee threshold for the output clipper, in int16 units. Above this
+# magnitude the signal is compressed 4:1 instead of hard-clipping straight
+# to full scale.
+_KNEE = const(24000)
+
 
 # ---------------- One-pole lowpass ----------------
 #   y[n] = y[n-1] + k * (x[n] - y[n-1])
@@ -571,8 +588,11 @@ def _cutoff_k(pct):
 CUTOFF_TABLE = tuple(_cutoff_k(p) for p in range(101))
 
 # Carried across blocks -- a per-block reset would put a discontinuity at
-# every block boundary.
-lp_state = 0
+# every block boundary. Two filter stages (see generate_block's cascaded
+# one-pole design) plus the smoothed cutoff coefficient.
+lp1_state = 0
+lp2_state = 0
+k_now_state = -1
 
 
 @micropython.native
@@ -663,33 +683,27 @@ def generate_block(volume_pct, cutoff_pct):
     tap sits after the filter so effects bake into a recording, and before
     volume so the knob still rides the loop.
     """
-    global lp_state
+    global lp1_state, lp2_state, k_now_state
 
-    # Bound to locals once; these would otherwise be dict lookups on every
-    # one of the 256 iterations.
     mb = mix_buf
     ob = out_buf
     n = BUF_SAMPLES
 
-    x = volume_pct / 100.0
-    vol = x * x / MIX_HEADROOM      # square law approximates perceived loudness
-    # Q10 master gain, table lookup -- no float arithmetic anywhere in
-    # this function. See VOL_TABLE.
     vol_q = VOL_TABLE[volume_pct]
 
     k_t = CUTOFF_TABLE[cutoff_pct]
-    if k_now < 0:
-        k_now = k_t
+    if k_now_state < 0:
+        k_now_state = k_t
     else:
-        d = k_t - k_now
+        d = k_t - k_now_state
         if d > 3 or d < -3:
-            k_now += d >> 2
+            k_now_state += d >> 2
         else:
-            k_now = k_t
-    k = k_now
+            k_now_state = k_t
+    k = k_now_state
 
-    y1 = lp1
-    y2 = lp2
+    y1 = lp1_state
+    y2 = lp2_state
 
     mb[:] = zero_buf
 
@@ -709,8 +723,8 @@ def generate_block(volume_pct, cutoff_pct):
         y2 += ((y1 - y2) * k) >> 10
         mb[i] = y2
         i += 1
-    lp1 = y1
-    lp2 = y2
+    lp1_state = y1
+    lp2_state = y2
 
     looper.process(mb, n)
 
@@ -820,7 +834,7 @@ while True:
         # Reports 100 (filter open) until GP27 has actually been swept
         # -- see read_pot. An unwired cutoff knob is inaudible instead
         # of muffling the whole set.
-        cutoff = read_pot(POT_CUTOFF, 100)
+        cutoff = read_pot(POT_CUTOFF)
         if (previous_cutoff == -1
                 or abs(cutoff - previous_cutoff) >= CUTOFF_DEADBAND):
             previous_cutoff = cutoff
@@ -959,13 +973,18 @@ while True:
     # Cutting to silence while either is true is a click at the end of
     # every phrase.
     if (any_active or looper.state != loop.STOPPED
-            or lp2 > 16 or lp2 < -16 or lp1 > 16 or lp1 < -16):
+            or lp2_state > 16 or lp2_state < -16 or lp1_state > 16 or lp1_state < -16):
         generate_block(state["volume"], state["cutoff"])
         audio.write(out_buf)
     else:
-        # Integer floor-shift is asymmetric, so a small negative lp_state
-        # can converge to -1 and stay there as a DC offset.
-        lp_state = 0
+        # Integer floor-shift is asymmetric, so a small negative filter
+        # state can converge to -1 and stay there as a DC offset. Also
+        # reset the smoothed cutoff coefficient so the next note doesn't
+        # inherit a stale ramp target.
+        lp1_state = 0
+        lp2_state = 0
+        k_now_state = -1
+
         audio.write(silence_buf)
 
     block_count += 1
