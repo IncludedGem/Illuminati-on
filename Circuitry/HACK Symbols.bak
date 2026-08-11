@@ -226,7 +226,7 @@
 		)
 		(embedded_fonts no)
 	)
-	(symbol "_1"
+	(symbol "OLED12864"
 		(exclude_from_sim no)
 		(in_bom yes)
 		(on_board yes)
@@ -273,7 +273,7 @@
 				(hide yes)
 			)
 		)
-		(symbol "_1_0_1"
+		(symbol "OLED12864_0_1"
 			(rectangle
 				(start -16.51 1.27)
 				(end -1.27 -10.16)
@@ -286,7 +286,7 @@
 				)
 			)
 		)
-		(symbol "_1_1_1"
+		(symbol "OLED12864_1_1"
 			(text "128x64"
 				(at -9.144 -6.858 0)
 				(effects
