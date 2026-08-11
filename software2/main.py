@@ -28,7 +28,6 @@ import os
 import sys
 import time
 import json
-import math
 from array import array
 from micropython import const
 from machine import Pin, I2C, ADC, I2S
@@ -82,9 +81,10 @@ LOOP_SECONDS = 4        # 188 KB for the two int16 buffers at this rate
 
 looper = loop.Looper(SAMPLE_RATE, BUF_SAMPLES, seconds=LOOP_SECONDS)
 
-# Must be imported after the Looper -- this builds 15 wavetables.
+# Must be imported after the Looper -- this builds the wavetable bank.
 from instruments import (TABLE_LEN, WAVETABLES, ENVELOPES, DRUM_KIT_NAME,
-                         shift_sample)
+                         shift_sample, pick_table, bank_bytes)
+import cutoff
 
 
 # ---------------- Note buttons ----------------
@@ -112,6 +112,15 @@ DRUM_FILES = (
     "kick.wav", "snare.wav", "hat_closed.wav", "hat_open.wav",
     "clap.wav", "tom_low.wav", "tom_mid.wav", "crash.wav",
 )
+
+# Q10 gain per drum, applied at mix time. The wav bank is already near full
+# scale (-1.4 dBFS peak on every file except the kick), so the problem was
+# never the source level -- it is that a drum is a transient. Measured RMS:
+# clap 2510, crash 3457, snare 4350, against a sustained note's ~20000. At
+# equal PEAK a transient reads far quieter, so the short bright hits get
+# lifted and the long crash gets pulled down. Tune by ear; the limiter
+# downstream will catch anything that gets greedy.
+DRUM_GAIN = (1300, 1150, 1024, 1024, 1400, 1150, 1150, 900)
 
 DRUM_KIT_DIR = "/"      # absolute, so it resolves the same however main.py is run
 
@@ -239,17 +248,19 @@ gc.collect()
 
 class DrumVoice:
     """One-shot sample playback. Goes idle when the sample runs out."""
-    __slots__ = ("active", "sample", "pos")
+    __slots__ = ("active", "sample", "pos", "gain")
 
     def __init__(self):
         self.active = False
         self.sample = None
         self.pos = 0
+        self.gain = 1024
 
     def note_on(self, drum_index):
         """Retriggering a sounding drum restarts it rather than layering."""
         self.sample = DRUM_SAMPLES[drum_index]
         self.pos = 0
+        self.gain = DRUM_GAIN[drum_index]
         self.active = True
 
     def note_off(self):
@@ -264,14 +275,20 @@ drum_voices = [DrumVoice() for _ in range(NUM_VOICES)]
 @micropython.native
 def render_drum_voice(v, mix_buf, n_samples):
     """Mix one drum voice into mix_buf. No phase, envelope or interpolation
-    -- these are recordings already at SAMPLE_RATE."""
+    -- these are recordings already at SAMPLE_RATE.
+
+    The Q10 gain is the only processing: the samples arrive near full scale
+    already, but a drum is a transient and a transient at the same PEAK as
+    a sustained note is much quieter to the ear. See DRUM_GAIN.
+    """
     sample = v.sample
     pos = v.pos
+    gain = v.gain
     sample_len = len(sample)
 
     n = 0
     while n < n_samples and pos < sample_len:
-        mix_buf[n] += sample[pos]
+        mix_buf[n] += (sample[pos] * gain) >> 10
         pos += 1
         n += 1
 
@@ -287,8 +304,8 @@ def render_drum_voice(v, mix_buf, n_samples):
 PRESET_FIELDS = ("octave", "key", "sample", "mode")
 
 presets = [
-    {"octave": 4, "key": "C", "sample": "Piano", "mode": "Major"},
-    {"octave": 5, "key": "F", "sample": "Organ", "mode": "Major"},
+    {"octave": 4, "key": "C", "sample": "Sine", "mode": "Major"},
+    {"octave": 5, "key": "F", "sample": "Sawtooth", "mode": "Major"},
 ]
 
 active_preset = 0
@@ -297,7 +314,7 @@ state = {
     "preset": 1,
     "octave": 4,
     "key": "C",
-    "sample": "Piano",
+    "sample": "Sine",
     "mode": "Major",
     "volume": 75,
     "cutoff": 100,          # 100 = filter fully open
@@ -342,10 +359,17 @@ previous_volume = -1
 previous_cutoff = -1
 
 
-def read_pot(ch):
+def read_pot(ch, uncal=None):
     """Return 0-100 for ADC channel `ch` using its own learned calibration.
     Averages 4 reads so a single noise spike cannot widen the range
-    permanently."""
+    permanently.
+
+    `uncal` overrides what is reported before the channel has been swept
+    far enough to trust. The call site for cutoff passes 100 so an unwired
+    or untouched knob leaves the filter open rather than muffling the set.
+    (This parameter was being passed already but did not exist -- the
+    cutoff read raised TypeError on the first pass of the main loop.)
+    """
     a = adc_channels[ch]
     raw = (a.read_u16() + a.read_u16() + a.read_u16() + a.read_u16()) >> 2
 
@@ -356,10 +380,17 @@ def read_pot(ch):
 
     span = adc_max[ch] - adc_min[ch]
     if span < MIN_ADC_SPAN:
-        return UNCAL_DEFAULT[ch]
+        return UNCAL_DEFAULT[ch] if uncal is None else uncal
 
     pct = round((raw - adc_min[ch]) / span * 100)
     return max(0, min(100, pct))
+
+
+def pot_calibrated(ch):
+    """Whether this channel has seen enough travel to be trusted. The
+    startup banner reports it, because "the cutoff knob does nothing" and
+    "the cutoff knob has not been swept yet" look identical on stage."""
+    return (adc_max[ch] - adc_min[ch]) >= MIN_ADC_SPAN
 
 
 # ---------------- OLED ----------------
@@ -414,64 +445,12 @@ _FRAC_MASK = const(255)
 _LVL_ONE = const(8388608)         # 1 << 23
 _LVL_TO_Q15 = const(8)
 
-# Absolute floor at which a release gives up and snaps to zero: -54 dBFS
-# of the envelope, before MIX_HEADROOM and the volume knob touch it. An
-# exponential never actually reaches zero, so something has to end it,
-# and the alternative -- waiting for the +1 in the step below to walk it
-# down one unit at a time -- would leave a Bell inaudibly ringing for
-# seconds while its voice stayed allocated.
-_ENV_FLOOR = const(16384)                 # 1 << 14
-
-
-def _env_shifts(n_samples):
-    """Two shift counts whose reciprocals sum to the per-sample fraction
-    an exponential needs to fall to 1% of its starting gap in n_samples.
-
-    WHY SHIFTS AND NOT A MULTIPLY. Exponential decay is level *= r each
-    sample, and r is very close to 1 -- Bell's release needs 0.99980, so
-    about 16 fractional bits. level is Q23 and peaks at 8388608, and
-    8388608 * 65536 = 5.5e11, which blows straight past MicroPython's
-    31-bit small-int ceiling and starts allocating big ints inside the
-    audio loop. That is the one thing this whole file is arranged to
-    avoid.
-
-    A sum of two reciprocal powers of two -- level -= (level >> a) +
-    (level >> b) -- is pure integer shifting, cannot overflow at any
-    level, and lands within a few percent of any ratio we need. One
-    shift alone would only give ratios a factor of 2 apart, i.e. decay
-    times off by up to 100%; the second shift brings that to under 40%,
-    which for envelope times that were chosen by ear anyway is well
-    inside taste.
-
-    `a` is clamped at 13 so that (level >> a) is still non-zero near
-    _ENV_FLOOR -- otherwise a long release would stop moving before it
-    reached the floor. `b` needs no clamp: if (level >> b) rounds to
-    zero, `a` is still carrying the decay.
-
-    Runs once per keypress, so the float maths here costs nothing."""
-    d = 1.0 - 0.01 ** (1.0 / n_samples)
-
-    a = 1
-    while a < 13 and (1.0 / (1 << a)) > d:
-        a += 1
-
-    rem = d - 1.0 / (1 << a)
-    if rem <= 0:
-        b = 30            # `a` already overshoots; make `b` contribute nothing
-    else:
-        b = 1
-        while b < 30 and (1.0 / (1 << b)) > rem:
-            b += 1
-
-    return a, b
-
 
 class Voice:
     __slots__ = (
         "active", "table", "phase", "phase_inc", "stage", "level",
-        "attack_step", "sustain_level",
-        "decay_a", "decay_b", "decay_end",
-        "release_a", "release_b", "release_end",
+        "attack_step", "decay_step", "sustain_level", "release_step",
+        "sustain_decay_step",
     )
 
     def __init__(self):
@@ -482,23 +461,24 @@ class Voice:
         self.stage = _IDLE
         self.level = 0
         self.attack_step = 0
+        self.decay_step = 0
         self.sustain_level = 0
-        self.decay_a = 1
-        self.decay_b = 30
-        self.decay_end = 0
-        self.release_a = 1
-        self.release_b = 30
-        self.release_end = _ENV_FLOOR
+        self.release_step = 0
+        self.sustain_decay_step = 0
 
     def note_on(self, freq, instrument):
         # Float maths is fine here -- this runs once per keypress, and
         # everything stored is an integer.
-        self.table = WAVETABLES.get(instrument, WAVETABLES["Sine"])
+        #
+        # The table is chosen by FREQUENCY, not by instrument alone: each
+        # instrument has several band-limited versions and this picks the
+        # richest one that will not alias at this pitch. See instruments.py.
+        self.table = pick_table(instrument, freq)
         self.phase = 0
         self.phase_inc = int(freq * TABLE_LEN * 65536 / SAMPLE_RATE)
 
-        a_ms, d_ms, s_lvl, r_ms = ENVELOPES.get(
-            instrument, ENVELOPES[DEFAULT_SAMPLE])
+        a_ms, d_ms, s_lvl, r_ms, sd_ms = ENVELOPES.get(instrument,
+                                                       ENVELOPES["Sine"])
         a_samples = max(1, int(a_ms * SAMPLE_RATE / 1000))
         d_samples = max(1, int(d_ms * SAMPLE_RATE / 1000))
         r_samples = max(1, int(r_ms * SAMPLE_RATE / 1000))
@@ -508,23 +488,21 @@ class Voice:
         # max(1, ...) everywhere: a step of 0 is a note that never leaves
         # its stage, i.e. stuck on forever.
         self.attack_step = max(1, _LVL_ONE // a_samples)
+        self.decay_step = max(1, (_LVL_ONE - s_level) // d_samples)
         self.sustain_level = s_level
+        self.release_step = max(1, s_level // r_samples)
 
-        # Decay and release are EXPONENTIAL -- see _env_shifts. Each
-        # stage also carries the level at which it gives up, set at the
-        # design point (1% of the distance it had to travel) rather than
-        # at exact arrival, because an exponential's last 1% takes as
-        # long again as the whole audible part.
-        self.decay_a, self.decay_b = _env_shifts(d_samples)
-        self.decay_end = s_level + ((_LVL_ONE - s_level) >> 7)
-
-        self.release_a, self.release_b = _env_shifts(r_samples)
-        r_end = s_level >> 7
-        if r_end < _ENV_FLOOR:
-            r_end = _ENV_FLOOR
-        self.release_end = r_end
+        # 0 ms means hold forever (organ, flute, strings). Anything else is
+        # a plucked or struck instrument, which keeps decaying while held
+        # instead of parking at a sustain floor.
+        if sd_ms:
+            sd_samples = max(1, int(sd_ms * SAMPLE_RATE / 1000))
+            self.sustain_decay_step = max(1, s_level // sd_samples)
+        else:
+            self.sustain_decay_step = 0
 
         self.stage = _ATTACK
+        self.level = 0
         self.active = True
 
     def note_off(self):
@@ -541,38 +519,53 @@ out_buf = array("h", [0] * BUF_SAMPLES)
 zero_buf = array("l", [0] * BUF_SAMPLES)      # for a C-level clear of mix_buf
 silence_buf = array("h", [0] * BUF_SAMPLES)   # written directly when idle
 
-# Master headroom divisor, applied as (pct/100)^2 / MIX_HEADROOM. At 1.2 a
-# single note peaks at 0.83 of full scale at volume 100. Raise to 1.5-2.0
-# if chords crunch; 1.0 is the useful floor.
-MIX_HEADROOM = 1.2
+# ---------------- Master volume ----------------
+# VOL_TABLE was referenced by generate_block but never defined, which is a
+# NameError on the first block -- no audio at all. Restored here, with a
+# gentler curve than the square law the comment described.
+#
+# Square law is the textbook approximation of perceived loudness, but it is
+# brutal at the top of a pot that self-calibrates: the knob only reads 100
+# once it has been swept to its true mechanical end, and the default before
+# that is 75, which under a square law is 0.56 -- 5 dB down before anything
+# else in the chain. x^1.6 keeps the taper musical while putting unity at
+# the top instead of the old 0.83.
+
+VOL_CURVE = 1.6
 
 
-# ---------------- One-pole lowpass ----------------
-#   y[n] = y[n-1] + k * (x[n] - y[n-1])
-# k = 1 - exp(-2*pi*fc/fs), fixed point at a 10-bit scale (0..1024) so the
-# filter path is integer only. |x-y| peaks near 512000, and 512000 * 1024
-# = 524M, inside the 31-bit small-int range. A 12-bit scale would overflow
-# into big ints, i.e. allocation inside the audio loop.
-
-CUTOFF_MIN_HZ = 60
-CUTOFF_MAX_HZ = 5400    # just under Nyquist; must move if SAMPLE_RATE does
+def _vol_q(pct):
+    """Knob percent to Q10 master gain. 1024 == unity."""
+    if pct <= 0:
+        return 0
+    return int(round(((pct / 100.0) ** VOL_CURVE) * 1024))
 
 
-def _cutoff_k(pct):
-    """Pot percent to filter coefficient, exponential in frequency. A
-    linear map would put the whole audible sweep in the last 10% of travel."""
-    if pct >= 100:
-        return 1024     # fully open: y tracks x exactly
-    fc = CUTOFF_MIN_HZ * (CUTOFF_MAX_HZ / CUTOFF_MIN_HZ) ** (pct / 100.0)
-    k = 1.0 - math.exp(-2 * math.pi * fc / SAMPLE_RATE)
-    return max(1, min(1024, int(k * 1024)))
+VOL_TABLE = tuple(_vol_q(p) for p in range(101))
 
 
-CUTOFF_TABLE = tuple(_cutoff_k(p) for p in range(101))
+# ---------------- Output limiter ----------------
+# The old stage hard-clipped at +-32000. With eight voices summing to
+# +-256000 that meant a three-note chord was squared off into a buzz, while
+# a single sustained note sat far below full scale -- quiet AND garbled at
+# the same time, from the same missing gain stage.
+#
+# Soft knee instead: linear up to LIMIT_KNEE, then compress everything
+# above it into the remaining headroom. Single notes pass through
+# untouched at full level; chords lean on the knee and stay recognisable.
 
-# Carried across blocks -- a per-block reset would put a discontinuity at
-# every block boundary.
-lp_state = 0
+# The knee sits just above instruments.TABLE_AMP (28000) on purpose: one
+# voice at full envelope is below it, so a solo note passes through with
+# unity gain and no distortion at all. Only chords reach the compressed
+# region, which is exactly where compression belongs.
+LIMIT_KNEE = 28500
+LIMIT_CEIL = 32700          # true 16-bit full scale is 32767
+LIMIT_MAX_IN = 260000       # 8 voices plus drums, i.e. the realistic worst case
+
+# Q10 slope of the compressed region. Plain int, not const() -- const()
+# folds at compile time and wants a literal, not a derived expression.
+LIMIT_SLOPE = ((LIMIT_CEIL - LIMIT_KNEE) << 10) // (LIMIT_MAX_IN - LIMIT_KNEE)
+
 
 
 @micropython.native
@@ -592,13 +585,10 @@ def render_voice(v, mix_buf, n_samples):
     stage = v.stage
     level = v.level
     attack_step = v.attack_step
+    decay_step = v.decay_step
     sustain_level = v.sustain_level
-    decay_a = v.decay_a
-    decay_b = v.decay_b
-    decay_end = v.decay_end
-    release_a = v.release_a
-    release_b = v.release_b
-    release_end = v.release_end
+    release_step = v.release_step
+    sustain_decay_step = v.sustain_decay_step
 
     n = 0
     while n < n_samples:
@@ -622,22 +612,22 @@ def render_voice(v, mix_buf, n_samples):
                 level = _LVL_ONE
                 stage = _DECAY
         elif stage == _DECAY:
-            # Exponential toward the sustain floor: the step is a
-            # fraction of the REMAINING GAP, not a constant. Same cost
-            # as the old linear subtract -- two shifts and two adds, all
-            # integer, no overflow possible at any level.
-            #
-            # The +1 is a stall guard. Near the end the shifts can both
-            # round to zero, and without it the stage would sit one unit
-            # above its target forever with the voice still allocated.
-            gap = level - sustain_level
-            level -= (gap >> decay_a) + (gap >> decay_b) + 1
-            if level <= decay_end:
+            level -= decay_step
+            if level <= sustain_level:
                 level = sustain_level
                 stage = _SUSTAIN
+        elif stage == _SUSTAIN:
+            # sustain_decay_step is 0 for the instruments that genuinely
+            # hold (organ, flute, strings), so this costs one compare for
+            # them and nothing else.
+            if sustain_decay_step:
+                level -= sustain_decay_step
+                if level <= 0:
+                    level = 0
+                    stage = _IDLE
         elif stage == _RELEASE:
-            level -= (level >> release_a) + (level >> release_b) + 1
-            if level <= release_end:
+            level -= release_step
+            if level <= 0:
                 level = 0
                 stage = _IDLE
 
@@ -663,33 +653,20 @@ def generate_block(volume_pct, cutoff_pct):
     tap sits after the filter so effects bake into a recording, and before
     volume so the knob still rides the loop.
     """
-    global lp_state
-
     # Bound to locals once; these would otherwise be dict lookups on every
     # one of the 256 iterations.
     mb = mix_buf
     ob = out_buf
     n = BUF_SAMPLES
 
-    x = volume_pct / 100.0
-    vol = x * x / MIX_HEADROOM      # square law approximates perceived loudness
-    # Q10 master gain, table lookup -- no float arithmetic anywhere in
-    # this function. See VOL_TABLE.
+    # Q10 master gain, table lookup. The two float lines that used to sit
+    # here computed `vol` and then never used it -- and float arithmetic in
+    # a native function allocates on the heap, every block, forever.
     vol_q = VOL_TABLE[volume_pct]
 
-    k_t = CUTOFF_TABLE[cutoff_pct]
-    if k_now < 0:
-        k_now = k_t
-    else:
-        d = k_t - k_now
-        if d > 3 or d < -3:
-            k_now += d >> 2
-        else:
-            k_now = k_t
-    k = k_now
-
-    y1 = lp1
-    y2 = lp2
+    knee = LIMIT_KNEE
+    slope = LIMIT_SLOPE
+    ceil = LIMIT_CEIL
 
     mb[:] = zero_buf
 
@@ -703,33 +680,30 @@ def generate_block(volume_pct, cutoff_pct):
         if dv.active:
             render_drum_voice(dv, mb, n)
 
-    i = 0
-    while i < n:
-        y1 += ((mb[i] - y1) * k) >> 10
-        y2 += ((y1 - y2) * k) >> 10
-        mb[i] = y2
-        i += 1
-    lp1 = y1
-    lp2 = y2
+    cutoff.process(mb, n, cutoff_pct)
 
     looper.process(mb, n)
 
     i = 0
     while i < n:
         total = (mb[i] * vol_q) >> 10
-        if total > _KNEE:
-            total = _KNEE + ((total - _KNEE) >> 2)
-            if total > 32000:
-                total = 32000
-        elif total < -_KNEE:
-            total = -_KNEE + ((total + _KNEE) >> 2)
-            if total < -32000:
-                total = -32000
+
+        if total > knee:
+            total = knee + (((total - knee) * slope) >> 10)
+            if total > ceil:
+                total = ceil
+        elif total < -knee:
+            total = -knee + (((total + knee) * slope) >> 10)
+            if total < -ceil:
+                total = -ceil
+
         ob[i] = total
         i += 1
 
 
 # ---------------- Startup ----------------
+
+cutoff.configure(SAMPLE_RATE)
 
 sync_state()
 oled.displayState(state, looper)
@@ -737,12 +711,21 @@ oled.flush()        # displayState only queues; drain the first paint now
 looper.update_bar(oled.display)
 
 print("--- Pico 2 W Music Controller | Team 13 ---")
-print("keypad: #/9 key +-  0/8 octave +-  */7 instrument +-  6 mode")
+print("keypad: #/9 key +-  0/8 octave +-  */7 sample +-  6 mode")
 print("        3 preset  5 rec  4 play/pause  1 loop reset")
 print("loop: %.2f s | %d blocks | %d KB" % (
     looper.capacity / SAMPLE_RATE,
     looper.n_blocks,
     looper.capacity * 4 // 1024))
+print("wavetables: %d KB | filter: %d-%d Hz, res %d" % (
+    bank_bytes() // 1024, cutoff.corner_hz(0), cutoff.corner_hz(98),
+    cutoff.RESONANCE))
+
+# "The cutoff knob does nothing" and "the cutoff knob has not been swept
+# far enough to calibrate yet" are the same symptom. Say which it is.
+print("pots: volume %s, cutoff %s" % (
+    "live" if pot_calibrated(POT_VOLUME) else "UNCALIBRATED (sweep it)",
+    "live" if pot_calibrated(POT_CUTOFF) else "UNCALIBRATED (sweep it)"))
 print("free heap after init:", gc.mem_free())
 print("#" + json.dumps(state))
 
@@ -766,10 +749,6 @@ GC_EVERY_N_BLOCKS = 20
 GC_MAX_BLOCKS = 40
 block_count = 0
 
-# Pots are polled every Nth pass rather than every pass -- see the pot
-# section of the main loop. 4 passes is ~85 ms at this block period.
-POT_EVERY_N_BLOCKS = 4
-pot_turn = POT_EVERY_N_BLOCKS     # start due, so the first pass reads them
 
 # ---------------- Main loop ----------------
 
@@ -789,19 +768,23 @@ while True:
         # front: melodic minor's 6th/7th is a per-note decision.
         for i in range(NUM_VOICES):
             if key_bits[i] and not prev_key_bits[i]:
-                ascending = (last_degree_index is None
-                             or i > last_degree_index)
-                freq = build_scale_freqs(
-                    preset["key"], preset["octave"], preset["mode"],
-                    i, ascending)
-                voices[i].note_on(freq, preset["sample"])
-                last_degree_index = i
+                if is_drums:
+                    drum_voices[i].note_on(i)
+                else:
+                    ascending = (last_degree_index is None
+                                 or i > last_degree_index)
+                    freq = build_scale_freqs(
+                        preset["key"], preset["octave"], preset["mode"],
+                        i, ascending)
+                    voices[i].note_on(freq, preset["sample"])
+                    last_degree_index = i
             elif prev_key_bits[i] and not key_bits[i]:
                 # Both, unconditionally. is_drums reflects the sample
                 # selected now, but the voice being released started under
                 # whatever was selected then -- cycling sample or preset
                 # while holding a note would otherwise strand it sounding.
                 voices[i].note_off()
+                drum_voices[i].note_off()
 
         state_keys = state["keys"]
         for i in range(NUM_VOICES):
@@ -817,15 +800,14 @@ while True:
         state["volume"] = volume
         changed = True
 
-        # Reports 100 (filter open) until GP27 has actually been swept
-        # -- see read_pot. An unwired cutoff knob is inaudible instead
-        # of muffling the whole set.
-        cutoff = read_pot(POT_CUTOFF, 100)
-        if (previous_cutoff == -1
-                or abs(cutoff - previous_cutoff) >= CUTOFF_DEADBAND):
-            previous_cutoff = cutoff
-            state["cutoff"] = cutoff
-            changed = True
+    # Reports 100 (filter open) until GP27 has actually been swept -- see
+    # read_pot. An unwired cutoff knob is now inaudible instead of
+    # muffling the whole set.
+    cutoff = read_pot(POT_CUTOFF, 100)
+    if previous_cutoff == -1 or abs(cutoff - previous_cutoff) >= CUTOFF_DEADBAND:
+        previous_cutoff = cutoff
+        state["cutoff"] = cutoff
+        changed = True
 
     # --- keypad ---
     pressed_key = scan_keypad()
@@ -959,13 +941,13 @@ while True:
     # Cutting to silence while either is true is a click at the end of
     # every phrase.
     if (any_active or looper.state != loop.STOPPED
-            or lp2 > 16 or lp2 < -16 or lp1 > 16 or lp1 < -16):
+            or cutoff.tail_active()):
         generate_block(state["volume"], state["cutoff"])
         audio.write(out_buf)
     else:
-        # Integer floor-shift is asymmetric, so a small negative lp_state
-        # can converge to -1 and stay there as a DC offset.
-        lp_state = 0
+        # Integer floor-shift is asymmetric, so a small negative filter
+        # state can converge to -1 and stay there as a DC offset.
+        cutoff.reset()
         audio.write(silence_buf)
 
     block_count += 1
