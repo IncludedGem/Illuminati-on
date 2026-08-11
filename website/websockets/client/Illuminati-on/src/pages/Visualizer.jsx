@@ -44,7 +44,7 @@ export default function Visualizer() {
     let cancelled = false
 
     function connect() {
-      const ws = new WebSocket("ws://localhost:8765")
+      const ws = new WebSocket("ws://192.168.50.16:8765")
       wsRef.current = ws
 
       ws.onopen = () => !cancelled && setConnected(true)

@@ -5,9 +5,9 @@ import serial
 import websockets
 
 # Configuration
-SERIAL_PORT = "COM7"  # Windows: COM3/COM7/... | macOS: /dev/tty.usbmodem* | Linux: /dev/ttyACM0
+SERIAL_PORT = "COM8"  # Windows: COM3/COM7/... | macOS: /dev/tty.usbmodem* | Linux: /dev/ttyACM0
 BAUD_RATE = 115200
-WEBSOCKET_URL = "ws://localhost:8765"
+WEBSOCKET_URL = "ws://192.168.50.16:8765"
 
 RECONNECT_DELAY = 1.5
 
