@@ -5,13 +5,13 @@ import AmbientBackground from "./AmbientBackground"
 const songs = [
   {
     icon: Music,
-    title: "Song 1",
-    body: "By: Artist",
+    title: "Interstellar Theme",
+    body: "By: Hans Zimmer",
   },
   {
     icon: Music,
-    title: "Song 2",
-    body: "By: Artist",
+    title: "Crowd Suggestion Freestyle",
+    body: "By: Yosef Lowy",
   },
 ]
 
@@ -60,7 +60,7 @@ export default function Home() {
           <div className="mt-16 flex justify-center">
             <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
               <img
-                src="/images/placeholder-instrument.png"
+                src="/images/device.png"
                 alt="Picture of instrument"
                 className="h-128 w-128 object-cover"
                 loading="eager"
@@ -73,37 +73,63 @@ export default function Home() {
       {/* Features */}
       {/* Song list temporarily disabled -- re-enable by uncommenting
           the block below once there's a real set list to show. */}
-      {/*
-      <section className="border-t border-border bg-muted/40">
-        <div className="mx-auto max-w-6xl px-6 py-20">
-          <div className="max-w-2xl">
-            <h2 className="text-balance text-3xl font-semibold tracking-tight md:text-4xl">
-              Our Set-list
-            </h2>
-            <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
-              Carefully curated songs to be played by Illuminai-on.
-            </p>
-          </div>
+      
+<section className="border-t border-border bg-muted/40">
+  <div className="mx-auto max-w-6xl px-6 py-20">
+    <div className="max-w-2xl">
+      <h2 className="text-balance text-3xl font-semibold tracking-tight md:text-4xl">
+        Our Set-list
+      </h2>
+      <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
+        Carefully curated songs to be played by Illuminai-on.
+      </p>
+    </div>
 
-          <div className="mt-12 grid gap-6 md:grid-cols-2">
-            {songs.map((f) => (
-              <div
-                key={f.title}
-                className="rounded-2xl border border-border bg-card p-6"
-              >
-                <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft text-accent">
-                  <f.icon className="h-5 w-5" />
-                </span>
-                <h3 className="mt-5 text-lg font-semibold tracking-tight">{f.title}</h3>
-                <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-                  {f.body}
-                </p>
-              </div>
-            ))}
-          </div>
+    <div className="mt-12 grid gap-6 md:grid-cols-2">
+      {songs.map((f) => (
+        <div
+          key={f.title}
+          className="rounded-2xl border border-border bg-card p-6"
+        >
+          <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft text-accent">
+            <f.icon className="h-5 w-5" />
+          </span>
+          <h3 className="mt-5 text-lg font-semibold tracking-tight">
+            {f.title}
+          </h3>
+          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+            {f.body}
+          </p>
         </div>
-      </section>
-      */}
+      ))}
+    </div>
+
+    {/* Performance Video */}
+    <div className="mt-16">
+      <div className="max-w-2xl">
+        <h2 className="text-balance text-3xl font-semibold tracking-tight md:text-4xl">
+          Our Performance
+        </h2>
+        <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
+          Watch Illuminati-on perform live.
+        </p>
+      </div>
+
+      <div className="mt-12">
+        <div className="aspect-video w-full overflow-hidden rounded-2xl border border-border bg-card">
+          <iframe
+            src="https://drive.google.com/file/d/1X90GhCbtcUeG34be2yVjALwFA4HEA0Ds/preview"
+            className="h-full w-full"
+            allow="autoplay"
+            allowFullScreen
+            title="Illuminai-on Performance"
+          />
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+     
 
       {/* CTA */}
       <section className="mx-auto max-w-6xl px-6 py-24">
